@@ -418,7 +418,9 @@ Panel {
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: "No SSH rules yet"
+              text: tailssh.newTailnet
+                ? "No rules for " + (tailssh.tailnetName !== "" ? tailssh.tailnetName : "this tailnet")
+                : "No SSH rules yet"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.subtitle
@@ -429,7 +431,11 @@ Panel {
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: "Setup reads your tailnet, groups the machines it finds, and asks "
+              text: tailssh.newTailnet
+                ? "Rules are kept per tailnet, because the machines change completely "
+                  + "when you switch. Your other tailnets are untouched \u2014 setup will "
+                  + "add a section for this one."
+                : "Setup reads your tailnet, groups the machines it finds, and asks "
                   + "which user to log in as. It never guesses one."
               color: root.dim
               font.family: root.fontFamily
@@ -456,7 +462,7 @@ Panel {
               width: parent.width
               textFormat: Text.PlainText
               text: "Machines are listed below regardless; without rules they use "
-                  + tailssh.userName + "."
+                  + tailssh.effectiveDefaultUser + "."
               color: Qt.darker(root.foreground, 2.1)
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption

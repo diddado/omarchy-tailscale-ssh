@@ -20,8 +20,11 @@ check() { # description  actual  expected
   fi
 }
 
-gen() { ./bin/setup --print --status-file "test/fixtures/$1.json"; }
-rules() { gen "$1" | jq -c '.rules'; }
+EMPTY_OUT="$(mktemp -u)"
+gen() { ./bin/setup --print --status-file "test/fixtures/$1.json" --output "$EMPTY_OUT"; }
+# Rules for the one tailnet the fixture describes.
+rules() { gen "$1" | jq -c '[.tailnets[].rules] | add // []'; }
+genrules() { gen "$1" | jq -c '[.tailnets[].rules] | add // []'; }
 
 echo
 echo "valid JSON for every fixture"
@@ -39,40 +42,40 @@ done
 echo
 echo "ephemeral machines are matched by prefix, never by hostname"
 check "a fleet with generated names becomes one prefix rule" \
-  "$(gen ephemeral | jq -c '[.rules[] | select(.prefix == "app-worker-")]')" \
+  "$(gen ephemeral | jq -c '[.tailnets[].rules[] | select(.prefix == "app-worker-")]')" \
   '[{"prefix":"app-worker-","group":"App Worker"}]'
 check "a LONE ephemeral machine still gets a prefix rule, not a host stub" \
-  "$(gen ephemeral | jq -c '[.rules[] | select(.prefix == "media-encoder-")] | length')" \
+  "$(gen ephemeral | jq -c '[.tailnets[].rules[] | select(.prefix == "media-encoder-")] | length')" \
   '1'
 check "no ephemeral machine is written as an exact host rule" \
-  "$(gen ephemeral | jq -c '[.rules[] | select(.host? // "" | test("-i-[0-9a-f]{8,}$"))] | length')" \
+  "$(gen ephemeral | jq -c '[.tailnets[].rules[] | select(.host? // "" | test("-i-[0-9a-f]{8,}$"))] | length')" \
   '0'
 
 echo
 echo "prefix clustering"
 check "a prefix covering several stable machines earns a rule" \
-  "$(gen tagged | jq -c '[.rules[] | select(.prefix == "app-")] | length')" \
+  "$(gen tagged | jq -c '[.tailnets[].rules[] | select(.prefix == "app-")] | length')" \
   '1'
 check "unrelated stable machines get exact-host stubs" \
   "$(rules flat)" \
   '[{"host":"desktop"},{"host":"nas"},{"host":"router"}]'
 check "a machine covered by a prefix is not also given a host stub" \
-  "$(gen tagged | jq -c '[.rules[] | select(.host? == "app-primary")] | length')" \
+  "$(gen tagged | jq -c '[.tailnets[].rules[] | select(.host? == "app-primary")] | length')" \
   '0'
 
 echo
 echo "tags"
 check "a tag on two or more machines earns a rule" \
-  "$(gen tagged | jq -c '[.rules[] | select(.tag == "tag:role-app")] | length')" \
+  "$(gen tagged | jq -c '[.tailnets[].rules[] | select(.tag == "tag:role-app")] | length')" \
   '1'
 check "a tag on a single machine does not" \
-  "$(gen tagged | jq -c '[.rules[] | select(.tag? == "tag:role-primary")] | length')" \
+  "$(gen tagged | jq -c '[.tailnets[].rules[] | select(.tag? == "tag:role-primary")] | length')" \
   '0'
 
 echo
 echo "usernames are never invented"
 check "no generated rule sets a user" \
-  "$(gen ephemeral | jq -c '[.rules[] | select(has("user"))] | length')" \
+  "$(gen ephemeral | jq -c '[.tailnets[].rules[] | select(has("user"))] | length')" \
   '0'
 check "defaultUser is the local account, not a guess" \
   "$(gen flat | jq -r '.defaultUser')" \
@@ -87,7 +90,7 @@ check "a single-machine tailnet works" \
   "$(rules single)" \
   '[{"host":"desktop"}]'
 check "mullvad exit nodes are never offered as ssh targets" \
-  "$(gen mullvad | jq -c '[.rules[] | select((.host? // "") | test("mullvad"))] | length')" \
+  "$(gen mullvad | jq -c '[.tailnets[].rules[] | select((.host? // "") | test("mullvad"))] | length')" \
   '0'
 
 echo
@@ -109,8 +112,54 @@ else
 fi
 
 echo
+echo "multiple tailnets"
+TMPCFG="$(mktemp)"; trap 'rm -f "$TMPCFG"' EXIT
+
+./bin/setup --yes --status-file test/fixtures/ephemeral.json --output "$TMPCFG" >/dev/null
+check "first run creates a section for the connected tailnet" \
+  "$(jq -c '.tailnets | keys' "$TMPCFG")" \
+  '["example-net.ts.net"]'
+
+./bin/setup --yes --status-file test/fixtures/other-tailnet.json --output "$TMPCFG" >/dev/null
+check "setting up a second tailnet keeps the first" \
+  "$(jq -c '.tailnets | keys | sort' "$TMPCFG")" \
+  '["example-net.ts.net","other-net.ts.net"]'
+check "the first tailnet's rules are untouched" \
+  "$(jq -c '[.tailnets["example-net.ts.net"].rules[] | select(.prefix == "app-worker-")] | length' "$TMPCFG")" \
+  '1'
+check "the second tailnet gets its own machines" \
+  "$(jq -c '[.tailnets["other-net.ts.net"].rules[].host] | sort' "$TMPCFG")" \
+  '["gateway","vault"]'
+check "each tailnet records its display name" \
+  "$(jq -r '.tailnets["other-net.ts.net"].name' "$TMPCFG")" \
+  'other.org'
+
+echo
+echo "an old flat config is preserved, never reattributed"
+V1="$(mktemp)"
+cat >"$V1" <<'V1EOF'
+{ "version": 1, "defaultUser": "someone", "rules": [ { "host": "legacy-box", "user": "root" } ] }
+V1EOF
+./bin/setup --yes --status-file test/fixtures/other-tailnet.json --output "$V1" >/dev/null
+check "a v1 file is rewritten as a v2 document" "$(jq -r '.version' "$V1")" '2'
+check "with a section for the tailnet that was connected" \
+  "$(jq -c '.tailnets | keys' "$V1")" \
+  '["other-net.ts.net"]'
+# Which tailnet a flat v1 file was written for is not knowable, so its rules are
+# neither adopted nor discarded -- they are carried through untouched.
+check "unattributed rules from the old schema are preserved, not misfiled" \
+  "$(jq -c '[.rules[].host]' "$V1")" \
+  '["legacy-box"]'
+check "and are not claimed by the connected tailnet" \
+  "$(jq -c '[.tailnets["other-net.ts.net"].rules[] | select(.host == "legacy-box")] | length' "$V1")" \
+  '0'
+check "an existing defaultUser is preserved, not overwritten" \
+  "$(jq -r '.defaultUser' "$V1")" 'someone'
+rm -f "$V1"
+
+echo
 echo "config shape"
-check "carries a version stamp" "$(gen flat | jq -r '.version')" '1'
+check "carries a version stamp" "$(gen flat | jq -r '.version')" '2'
 check "seeds a keepalive" "$(gen flat | jq -c '.sshArgs')" '["-o","ServerAliveInterval=30"]'
 
 echo

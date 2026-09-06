@@ -62,6 +62,17 @@ read_status() {
 
 STATUS="$(read_status)"
 
+# Identify the tailnet. Keyed on MagicDNSSuffix because it is unique, survives a
+# rename, and is readable without root -- unlike `tailscale switch --list`,
+# which needs an operator grant and is commonly denied.
+TAILNET_KEY="$(jq -r '.MagicDNSSuffix // (.CurrentTailnet.MagicDNSSuffix // "") // ""' <<<"$STATUS")"
+TAILNET_NAME="$(jq -r '.CurrentTailnet.Name // ""' <<<"$STATUS")"
+[[ -z $TAILNET_KEY ]] && TAILNET_KEY="$TAILNET_NAME"
+if [[ -z $TAILNET_KEY ]]; then
+  echo "setup: could not determine which tailnet this is; is Tailscale connected?" >&2
+  exit 1
+fi
+
 # hostname<TAB>tag,tag — Mullvad exit nodes are not machines you ssh into.
 PEERS="$(jq -r '
   (.Peer // {}) | to_entries[] | .value
@@ -176,6 +187,15 @@ CONFIG_HELP_JSON=$(cat <<'HELPEOF'
   "Tailscale SSH rules. Edits apply immediately - no restart.",
   "Full docs: https://github.com/diddado/omarchy-tailscale-ssh",
   "",
+  "Rules are kept per tailnet, under \"tailnets\", keyed by MagicDNS suffix.",
+  "The machines change completely when you switch accounts, so rules written",
+  "for one tailnet would be meaningless on another. Switching to a tailnet with",
+  "no section here makes the panel offer to set it up; your other sections are",
+  "never touched.",
+  "",
+  "\"defaultUser\" and \"sshArgs\" at the top level apply to every tailnet; a",
+  "tailnet may override defaultUser and adds to sshArgs.",
+  "",
   "Each rule needs exactly one matcher:",
   "  host    exact machine name, or its full MagicDNS name (case-insensitive)",
   "  tag     a Tailscale ACL tag; the 'tag:' prefix is optional",
@@ -243,14 +263,31 @@ emit_config() {
              + (if $user == "" then {} else {user: $user} end)) ]' <<<"$rules")"
   done
 
+  # Merge into the existing document so other tailnets survive. A v1 file (flat
+  # `rules`) is migrated by attributing its rules to the tailnet connected now,
+  # which is the only tailnet they could have been written for.
+  local existing='{}'
+  if [[ -s $OUTPUT ]] && jq -e 'type == "object"' "$OUTPUT" >/dev/null 2>&1; then
+    existing="$(cat "$OUTPUT")"
+  fi
+
   jq -n --arg defaultUser "$DEFAULT_USER" --argjson rules "$rules" \
-    --argjson readme "$CONFIG_HELP_JSON" '{
-    _readme: $readme,
-    version: 1,
-    defaultUser: $defaultUser,
-    sshArgs: ["-o", "ServerAliveInterval=30"],
-    rules: $rules
-  }'
+    --argjson readme "$CONFIG_HELP_JSON" --argjson existing "$existing" \
+    --arg key "$TAILNET_KEY" --arg name "$TAILNET_NAME" '
+    ($existing | if (.tailnets | type) == "object" then .tailnets else {} end) as $known
+    | ($existing
+       | if (.tailnets | type) != "object" and (.rules | type) == "array"
+         then { ($key): { name: $name, rules: .rules } }
+         else {} end) as $migrated
+    | {
+        _readme: $readme,
+        version: 2,
+        defaultUser: ($existing.defaultUser // $defaultUser),
+        sshArgs: ($existing.sshArgs // ["-o", "ServerAliveInterval=30"]),
+        tailnets: ($known + { ($key): { name: $name, rules: $rules } })
+      }
+      + (if (($existing.tailnets | type) != "object") and (($existing.rules | type) == "array")
+         then { rules: $existing.rules } else {} end)'
 }
 
 if $PRINT_ONLY; then
@@ -284,7 +321,12 @@ if [[ $total -eq 0 ]]; then
   exit 1
 fi
 
-say "Found $(printf '%s' "${#HOSTS[@]}") machines on your tailnet."
+say "Tailnet: ${TAILNET_NAME:-$TAILNET_KEY}"
+say "Found $(printf '%s' "${#HOSTS[@]}") machines on it."
+if [[ -s $OUTPUT ]] && jq -e --arg k "$TAILNET_KEY" '.tailnets[$k] // empty' "$OUTPUT" >/dev/null 2>&1; then
+  note "This tailnet already has rules; they will be replaced."
+  note "Rules for your other tailnets are not touched."
+fi
 echo
 say "Groups detected"
 for p in "${KEPT[@]}"; do

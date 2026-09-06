@@ -265,39 +265,47 @@ eq(Model.parseRules(Model.serializeConfig({ defaultUser: "me", rules: [{ host: "
 // treated as authoritative.
 
 function fresh() {
-  return { lastText: "", error: "", config: Model.parseRules(""), loaded: false, pendingBadText: "" }
+  return { lastText: "", error: "", config: Model.emptyDocument(), loaded: false, pendingBadText: "" }
 }
 function feed(state, text, readOk) {
   return Model.nextConfigState(state, { loaded: readOk !== false, text: text })
 }
 
-var CFG_A = Model.serializeConfig({ defaultUser: "me", rules: [{ prefix: "app-" }] })
-var CFG_B = Model.serializeConfig({ defaultUser: "me", rules: [{ prefix: "app-", user: "ubuntu" }] })
+var KEY = "tailA.ts.net"
+function docText(rules) {
+  return Model.serializeDocument(
+    Model.withTailnetRules(Model.emptyDocument(), KEY, "acme.com", rules))
+}
+// The reducer stores the whole document; rules are read back per tailnet.
+function rulesOf(state) { return Model.configForTailnet(state.config, KEY).rules }
+
+var CFG_A = docText([{ prefix: "app-" }])
+var CFG_B = docText([{ prefix: "app-", user: "ubuntu" }])
 var TRUNCATED = CFG_B.slice(0, 200)
 
 section("config reducer: a save is read cleanly")
 var st = feed(fresh(), CFG_A)
 eq(st.error, "", "a valid file loads without error")
-eq(st.config.rules.length, 1, "and its rules are adopted")
+eq(rulesOf(st).length, 1, "and its rules are adopted")
 
 section("config reducer: partial read, then the final good read")
 st = feed(feed(feed(fresh(), CFG_A), TRUNCATED), CFG_B)
 eq(st.error, "", "no error survives")
-eq(st.config.rules[0].user, "ubuntu", "the edit is adopted")
+eq(rulesOf(st)[0].user, "ubuntu", "the edit is adopted")
 
 section("config reducer: reloads complete out of order, partial lands last")
 st = feed(feed(feed(fresh(), CFG_A), CFG_B), TRUNCATED)
 eq(st.error, "", "a late partial read does not raise an error")
-eq(st.config.rules[0].user, "ubuntu", "and does not disturb the adopted rules")
+eq(rulesOf(st)[0].user, "ubuntu", "and does not disturb the adopted rules")
 
 section("config reducer: save reproduces the previous bytes")
 st = feed(feed(feed(fresh(), CFG_A), TRUNCATED), CFG_A)
 eq(st.error, "", "re-reading the already-adopted bytes clears a stale error")
-eq(st.config.rules.length, 1, "rules intact")
+eq(rulesOf(st).length, 1, "rules intact")
 
 section("config reducer: file briefly absent during a rename-style save")
 st = feed(feed(fresh(), CFG_A), "", false)
-eq(st.config.rules.length, 1, "a failed read never drops the loaded rules")
+eq(rulesOf(st).length, 1, "a failed read never drops the loaded rules")
 eq(st.error, "", "and is not reported as an error")
 eq(st.retry, true, "it asks to look again")
 eq(feed(fresh(), "", false).retry, false,
@@ -307,19 +315,19 @@ section("config reducer: a genuinely broken file")
 st = feed(feed(fresh(), CFG_A), TRUNCATED)
 eq(st.error, "", "one bad read is provisional, not an error")
 eq(st.retry, true, "it asks for a second look")
-eq(st.config.rules.length, 1, "the working rules stay loaded meanwhile")
+eq(rulesOf(st).length, 1, "the working rules stay loaded meanwhile")
 var confirmed = feed(st, TRUNCATED)
 eq(confirmed.error !== "", true, "the same bad bytes twice is a real error")
 eq(confirmed.retry, false, "and stops retrying")
-eq(confirmed.config.rules.length, 1, "even then the last good rules are kept")
+eq(rulesOf(confirmed).length, 1, "even then the last good rules are kept")
 
 section("config reducer: recovering from a broken file")
 eq(feed(confirmed, CFG_B).error, "", "fixing the file clears the error")
-eq(feed(confirmed, CFG_B).config.rules[0].user, "ubuntu", "and adopts the fix")
+eq(rulesOf(feed(confirmed, CFG_B))[0].user, "ubuntu", "and adopts the fix")
 
 section("config reducer: an empty file is not an empty ruleset")
 st = feed(feed(fresh(), CFG_A), "   \n")
-eq(st.config.rules.length, 1, "whitespace-only content is treated as mid-write")
+eq(rulesOf(st).length, 1, "whitespace-only content is treated as mid-write")
 
 section("row caption shows what is exceptional, not what is already on screen")
 var capPeer = { HostName: "app-worker-i-0b1e031df86719510",
@@ -337,6 +345,82 @@ eq(Model.rowDetail(capPeer, { user: "ubuntu", address: "100.64.0.5", port: 2222,
 eq(Model.rowDetail({ HostName: "nas", DNSName: "nas.example-net.ts.net", Tags: [] },
                    { user: "", address: "nas.example-net.ts.net", port: 0, command: "" }),
    "", "a machine with nothing notable gets no caption clutter")
+
+// ---------------------------------------------------------------------------
+// Multiple tailnets. Rules are meaningless across tailnets — the machines are
+// entirely different — so each gets its own section, and switching accounts
+// must never disturb the one you switched away from.
+
+section("identifying a tailnet")
+eq(Model.tailnetKeyFromStatus({ magicDnsSuffix: "tailA.ts.net", tailnetName: "acme.com" }),
+   "tailA.ts.net",
+   "keyed on MagicDNSSuffix: unique, survives a rename, readable without root")
+eq(Model.tailnetKeyFromStatus({ magicDnsSuffix: "", tailnetName: "acme.com" }), "acme.com",
+   "falls back to the name when MagicDNS is off")
+eq(Model.tailnetKeyFromStatus({}), "", "and is empty when we do not know yet")
+
+section("sections are independent")
+var docA = Model.withTailnetRules(Model.emptyDocument(), "tailA.ts.net", "acme.com",
+                                  [{ prefix: "app-", user: "ubuntu" }])
+var docAB = Model.withTailnetRules(docA, "tailB.ts.net", "other.org", [{ host: "nas", user: "root" }])
+eq(Object.keys(docAB.tailnets).sort(), ["tailA.ts.net", "tailB.ts.net"],
+   "adding a tailnet keeps the existing one")
+eq(Model.configForTailnet(docAB, "tailA.ts.net").rules, [{ prefix: "app-", user: "ubuntu" }],
+   "the first tailnet's rules are untouched")
+eq(Model.configForTailnet(docAB, "tailB.ts.net").rules, [{ host: "nas", user: "root" }],
+   "and the second gets its own")
+eq(Model.configForTailnet(docAB, "tailC.ts.net").rules, [],
+   "an unknown tailnet gets nothing rather than someone else's rules")
+eq(Model.hasTailnetConfig(docAB, "tailC.ts.net"), false, "and reports itself unconfigured")
+eq(Model.hasTailnetConfig(docAB, "tailB.ts.net"), true, "a configured one reports configured")
+eq(Model.hasTailnetConfig(docAB, ""), false, "an unknown current tailnet is never 'configured'")
+
+section("editing one tailnet does not touch another")
+var edited = Model.withTailnetRules(docAB, "tailB.ts.net", "other.org", [{ host: "nas", user: "admin" }])
+eq(Model.configForTailnet(edited, "tailA.ts.net").rules, [{ prefix: "app-", user: "ubuntu" }],
+   "the other tailnet survives an edit")
+eq(Model.configForTailnet(docAB, "tailB.ts.net").rules[0].user, "root",
+   "and the input document is not mutated")
+
+section("document-level defaults sit beneath per-tailnet values")
+var withDefaults = Model.parseConfigDocument(JSON.stringify({
+  version: 2, defaultUser: "me", sshArgs: ["-o", "ServerAliveInterval=30"],
+  tailnets: { "tailA.ts.net": { name: "acme.com", sshArgs: ["-i", "key.pem"], rules: [] },
+              "tailB.ts.net": { name: "other.org", defaultUser: "admin", rules: [] } }
+})).doc
+eq(Model.configForTailnet(withDefaults, "tailA.ts.net").defaultUser, "me",
+   "a tailnet with no user of its own inherits the document default")
+eq(Model.configForTailnet(withDefaults, "tailB.ts.net").defaultUser, "admin",
+   "and overrides it when it has one")
+eq(Model.configForTailnet(withDefaults, "tailA.ts.net").sshArgs,
+   ["-o", "ServerAliveInterval=30", "-i", "key.pem"],
+   "sshArgs concatenate, so a global keepalive survives a per-tailnet key")
+
+section("an old flat config is never attributed to a tailnet")
+// Which tailnet a v1 file was written for is not recorded and not inferable:
+// matching its rules against the machines in front of you gives false
+// positives whenever someone names machines similarly on two tailnets, which
+// is exactly what people do. So it is preserved, never adopted.
+var v1 = JSON.stringify({ version: 1, defaultUser: "me", rules: [{ prefix: "app-", user: "ubuntu" }] })
+var v1doc = Model.parseConfigDocument(v1).doc
+eq(v1doc.unassignedRules, [{ prefix: "app-", user: "ubuntu" }], "the flat rules are kept aside")
+eq(Model.hasTailnetConfig(v1doc, "tailA.ts.net"), false, "no tailnet claims them")
+eq(Model.configForTailnet(v1doc, "tailA.ts.net").rules, [], "and none of them leak into a tailnet")
+eq(JSON.parse(Model.serializeDocument(v1doc)).rules, [{ prefix: "app-", user: "ubuntu" }],
+   "they survive a rewrite untouched, so nothing is silently destroyed")
+var afterSetup = Model.withTailnetRules(v1doc, "tailA.ts.net", "acme.com", [{ host: "nas" }])
+eq(Model.configForTailnet(afterSetup, "tailA.ts.net").rules, [{ host: "nas" }],
+   "configuring a tailnet does not pull them in")
+eq(afterSetup.unassignedRules, [{ prefix: "app-", user: "ubuntu" }], "and still does not drop them")
+
+section("serialization round-trip")
+var round = Model.parseConfigDocument(Model.serializeDocument(docAB)).doc
+eq(Object.keys(round.tailnets).sort(), ["tailA.ts.net", "tailB.ts.net"], "both sections survive")
+eq(Model.configForTailnet(round, "tailA.ts.net").rules, [{ prefix: "app-", user: "ubuntu" }],
+   "with their rules")
+eq(JSON.parse(Model.serializeDocument(docAB))._readme.length > 5, true,
+   "and the reference block is still there")
+
 
 console.log("\n" + (failures === 0 ? "PASS" : "FAIL") + " — " + (checks - failures) + "/" + checks + " checks")
 process.exit(failures === 0 ? 0 : 1)

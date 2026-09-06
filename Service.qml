@@ -21,6 +21,7 @@ Item {
   property string backendState: "Unknown"
   property string statusText: "Checking…"
   property string tailnetName: ""
+  property string magicDnsSuffix: ""
   property string selfName: ""
   property string lastError: ""
   property string actionStatus: ""
@@ -29,7 +30,12 @@ Item {
   property var peers: []
   // Peers paired with their resolved ssh target: [{ peer, target }].
   property var entries: []
-  property var rulesConfig: ({ ok: true, error: "", defaultUser: "", sshArgs: [], rules: [] })
+  // The whole config file, holding one section per tailnet.
+  property var configDoc: Model.emptyDocument()
+  // Which tailnet we are actually on, learned from `tailscale status --json`.
+  property string tailnetKey: ""
+  // The flat view for the current tailnet, fed to the rule engine.
+  readonly property var rulesConfig: Model.configForTailnet(configDoc, tailnetKey)
   property string rulesError: ""
 
   readonly property string userName: Quickshell.env("USER") || Quickshell.env("LOGNAME") || ""
@@ -60,8 +66,16 @@ Item {
 
   // Setup has run when the config parsed and actually carries something.
   property bool configLoaded: false
-  readonly property bool configured: configLoaded && (
-    (rulesConfig.rules && rulesConfig.rules.length > 0) || String(rulesConfig.defaultUser || "") !== "")
+  // Gated on knowing the tailnet too: until the first status poll lands we
+  // cannot tell "no rules for this tailnet" from "we do not know which tailnet
+  // this is yet", and flashing the setup prompt at every startup is wrong.
+  readonly property bool tailnetKnown: tailnetKey !== ""
+  readonly property bool configured: configLoaded && tailnetKnown
+    && Model.hasTailnetConfig(configDoc, tailnetKey)
+  // True when other tailnets are configured but this one is not — a switch to
+  // an account we have never set up.
+  readonly property bool newTailnet: configLoaded && tailnetKnown && !configured
+    && Object.keys((configDoc && configDoc.tailnets) || {}).length > 0
   readonly property string connectVia: {
     // The rules file wins over the widget setting, so the whole SSH story can
     // live in one file if you prefer.
@@ -119,6 +133,7 @@ Item {
 
   onPeersChanged: rebuildEntries()
   onRulesConfigChanged: rebuildEntries()
+  onTailnetKeyChanged: rebuildEntries()
   onConnectViaChanged: rebuildEntries()
 
   function groupedEntries(query) {
@@ -239,7 +254,7 @@ Item {
     var next = Model.nextConfigState({
       lastText: _lastConfigText,
       error: rulesError,
-      config: rulesConfig,
+      config: configDoc,
       loaded: configLoaded,
       pendingBadText: _pendingBadText
     }, { loaded: readOk, text: text })
@@ -248,7 +263,7 @@ Item {
     _pendingBadText = next.pendingBadText
     rulesError = next.error
     // Same object when nothing changed, so this does not churn the entry list.
-    rulesConfig = next.config
+    configDoc = next.config
     configLoaded = next.loaded
     if (next.retry) configRetry.restart()
   }
@@ -272,17 +287,16 @@ Item {
   }
 
   function saveRules(nextRules) {
-    var next = {
-      defaultUser: rulesConfig.defaultUser,
-      connectVia: rulesConfig.connectVia,
-      sshArgs: rulesConfig.sshArgs,
-      rules: nextRules
+    if (!tailnetKnown) {
+      flash("Waiting for Tailscale before saving")
+      return
     }
-    var text = Model.serializeConfig(next)
+    var nextDoc = Model.withTailnetRules(configDoc, tailnetKey, tailnetName, nextRules)
+    var text = Model.serializeDocument(nextDoc)
     _lastConfigText = text
     _pendingBadText = ""
     rulesError = ""
-    rulesConfig = Model.parseRules(text)
+    configDoc = nextDoc
     configFile.setText(text)
     flash("Saved")
   }
@@ -344,6 +358,8 @@ Item {
     backendState = parsed.backendState
     running = parsed.running
     tailnetName = parsed.tailnetName
+    magicDnsSuffix = parsed.magicDnsSuffix
+    tailnetKey = Model.tailnetKeyFromStatus(parsed)
     selfName = parsed.selfName
     peers = parsed.peers
     lastError = ""

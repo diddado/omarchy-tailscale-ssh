@@ -1,0 +1,34 @@
+{
+  "BackendState": "Running",
+  "MagicDNSSuffix": "other-net.ts.net",
+  "CurrentTailnet": {
+    "Name": "other.org",
+    "MagicDNSSuffix": "other-net.ts.net"
+  },
+  "Self": {
+    "HostName": "laptop",
+    "DNSName": "laptop.other-net.ts.net."
+  },
+  "Peer": {
+    "k:a": {
+      "HostName": "vault",
+      "DNSName": "vault.other-net.ts.net.",
+      "TailscaleIPs": [
+        "100.99.0.1"
+      ],
+      "Online": true,
+      "OS": "linux",
+      "Tags": []
+    },
+    "k:b": {
+      "HostName": "gateway",
+      "DNSName": "gateway.other-net.ts.net.",
+      "TailscaleIPs": [
+        "100.99.0.1"
+      ],
+      "Online": true,
+      "OS": "linux",
+      "Tags": []
+    }
+  }
+}

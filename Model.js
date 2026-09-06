@@ -487,6 +487,15 @@ var CONFIG_HELP = [
   "Tailscale SSH rules. Edits apply immediately - no restart.",
   "Full docs: https://github.com/diddado/omarchy-tailscale-ssh",
   "",
+  "Rules are kept per tailnet, under \"tailnets\", keyed by MagicDNS suffix.",
+  "The machines change completely when you switch accounts, so rules written",
+  "for one tailnet would be meaningless on another. Switching to a tailnet with",
+  "no section here makes the panel offer to set it up; your other sections are",
+  "never touched.",
+  "",
+  "\"defaultUser\" and \"sshArgs\" at the top level apply to every tailnet; a",
+  "tailnet may override defaultUser and adds to sshArgs.",
+  "",
   "Each rule needs exactly one matcher:",
   "  host    exact machine name, or its full MagicDNS name (case-insensitive)",
   "  tag     a Tailscale ACL tag; the 'tag:' prefix is optional",
@@ -553,6 +562,163 @@ function rowDetail(peer, target) {
   return parts.join(" \u00b7 ")
 }
 
+// ---------------------------------------------------- multi-tailnet document
+
+// The config file holds one section per tailnet, because the machines you can
+// see change completely when you switch. Rules written for one tailnet are
+// meaningless on another, and silently applying them would be worse than
+// having none.
+//
+// Keyed on MagicDNSSuffix rather than the tailnet's display name: it is unique,
+// stable across a rename, and — unlike `tailscale switch --list`, which needs
+// root or an operator grant — it is readable from an unprivileged
+// `tailscale status --json`. Two accounts sharing a tailnet see the same
+// machines and correctly share a section.
+function tailnetKeyFromStatus(status) {
+  if (!status) return ""
+  var suffix = String(status.magicDnsSuffix || "")
+  if (suffix !== "") return suffix
+  // A tailnet with MagicDNS off still has a name worth keying on.
+  return String(status.tailnetName || "")
+}
+
+function emptyTailnetConfig() {
+  return { name: "", defaultUser: "", sshArgs: [], rules: [] }
+}
+
+// Normalizes both schemas into one shape. A v1 file is flat — one unnamed set
+// of rules — which is exactly a single-tailnet config whose owner we cannot
+// know from the file alone; `configForTailnet` adopts it for whichever tailnet
+// is connected when it is first read.
+function parseConfigDocument(text) {
+  var raw
+  try {
+    raw = JSON.parse(String(text || ""))
+  } catch (e) {
+    return { ok: false, error: String(e), doc: emptyDocument() }
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, error: "config file is not an object", doc: emptyDocument() }
+  }
+
+  var doc = {
+    version: 2,
+    defaultUser: String(raw.defaultUser || ""),
+    connectVia: raw.connectVia ? String(raw.connectVia) : "",
+    sshArgs: asArray(raw.sshArgs),
+    tailnets: {},
+    unassignedRules: null
+  }
+
+  if (raw.tailnets && typeof raw.tailnets === "object") {
+    for (var key in raw.tailnets) {
+      var entry = raw.tailnets[key] || {}
+      doc.tailnets[key] = {
+        name: String(entry.name || ""),
+        defaultUser: String(entry.defaultUser || ""),
+        connectVia: entry.connectVia ? String(entry.connectVia) : "",
+        sshArgs: asArray(entry.sshArgs),
+        rules: Array.isArray(entry.rules) ? entry.rules : []
+      }
+    }
+  } else if (Array.isArray(raw.rules)) {
+    // Not attributed to any tailnet: we cannot know which one it was written
+    // for. Carried through untouched so it is never silently lost.
+    doc.unassignedRules = raw.rules
+  }
+
+  return { ok: true, error: "", doc: doc }
+}
+
+function emptyDocument() {
+  return { version: 2, defaultUser: "", connectVia: "", sshArgs: [], tailnets: {}, unassignedRules: null }
+}
+
+function hasTailnetConfig(doc, key) {
+  if (!doc || !key) return false
+  return !!(doc.tailnets && doc.tailnets[key])
+}
+
+// The flat view the rule engine consumes, with document-level values acting as
+// defaults beneath the per-tailnet ones. sshArgs concatenate for the same
+// reason they do across rule tiers: a global keepalive should survive a tailnet
+// that only wants to add an identity file.
+function configForTailnet(doc, key) {
+  var flat = {
+    ok: true,
+    error: "",
+    name: "",
+    defaultUser: String((doc && doc.defaultUser) || ""),
+    connectVia: String((doc && doc.connectVia) || ""),
+    sshArgs: ((doc && doc.sshArgs) || []).slice(),
+    rules: []
+  }
+  if (!doc) return flat
+
+  var entry = doc.tailnets ? doc.tailnets[key] : null
+  if (!entry) return flat
+
+  flat.name = String(entry.name || "")
+  if (entry.defaultUser) flat.defaultUser = String(entry.defaultUser)
+  if (entry.connectVia) flat.connectVia = String(entry.connectVia)
+  flat.sshArgs = flat.sshArgs.concat(entry.sshArgs || [])
+  flat.rules = entry.rules || []
+  return flat
+}
+
+// Returns a NEW document with this tailnet's rules replaced. Every other
+// tailnet is carried through untouched — switching accounts must never cost
+// you the config for the one you switched away from.
+function withTailnetRules(doc, key, name, rules) {
+  var base = doc || emptyDocument()
+  var next = {
+    version: 2,
+    defaultUser: String(base.defaultUser || ""),
+    connectVia: String(base.connectVia || ""),
+    sshArgs: (base.sshArgs || []).slice(),
+    tailnets: {},
+    unassignedRules: base.unassignedRules || null
+  }
+  for (var k in (base.tailnets || {})) {
+    var e = base.tailnets[k]
+    next.tailnets[k] = {
+      name: e.name, defaultUser: e.defaultUser, connectVia: e.connectVia,
+      sshArgs: (e.sshArgs || []).slice(), rules: (e.rules || []).slice()
+    }
+  }
+
+  var existing = next.tailnets[key] || { name: "", defaultUser: "", connectVia: "", sshArgs: [] }
+  next.tailnets[key] = {
+    name: String(name || existing.name || ""),
+    defaultUser: existing.defaultUser || "",
+    connectVia: existing.connectVia || "",
+    sshArgs: (existing.sshArgs || []).slice(),
+    rules: rules || []
+  }
+  return next
+}
+
+function serializeDocument(doc) {
+  var out = {
+    _readme: CONFIG_HELP,
+    version: 2,
+    defaultUser: String(doc.defaultUser || ""),
+    sshArgs: doc.sshArgs || [],
+    tailnets: {}
+  }
+  if (doc.connectVia) out.connectVia = String(doc.connectVia)
+  if (doc.unassignedRules) out.rules = doc.unassignedRules
+  for (var k in (doc.tailnets || {})) {
+    var e = doc.tailnets[k]
+    var entry = { name: e.name || "", rules: e.rules || [] }
+    if (e.defaultUser) entry.defaultUser = e.defaultUser
+    if (e.connectVia) entry.connectVia = e.connectVia
+    if (e.sshArgs && e.sshArgs.length > 0) entry.sshArgs = e.sshArgs
+    out.tailnets[k] = entry
+  }
+  return JSON.stringify(out, null, 2) + "\n"
+}
+
 // ---------------------------------------------------- config load reducer
 
 // Deciding what to do with a config read is genuinely stateful, and getting it
@@ -572,7 +738,7 @@ function nextConfigState(prev, incoming) {
   var state = {
     lastText: (prev && prev.lastText) || "",
     error: (prev && prev.error) || "",
-    config: (prev && prev.config) || parseRules(""),
+    config: (prev && prev.config) || emptyDocument(),
     loaded: !!(prev && prev.loaded),
     pendingBadText: (prev && prev.pendingBadText) || "",
     retry: false
@@ -602,9 +768,9 @@ function nextConfigState(prev, incoming) {
     return state
   }
 
-  var parsed = parseRules(raw)
+  var parsed = parseConfigDocument(raw)
   if (parsed.ok) {
-    state.config = parsed
+    state.config = parsed.doc
     state.lastText = raw
     state.error = ""
     state.pendingBadText = ""
@@ -648,6 +814,13 @@ if (typeof module !== "undefined") {
     serializeConfig: serializeConfig,
     CONFIG_HELP: CONFIG_HELP,
     nextConfigState: nextConfigState,
-    rowDetail: rowDetail
+    rowDetail: rowDetail,
+    tailnetKeyFromStatus: tailnetKeyFromStatus,
+    parseConfigDocument: parseConfigDocument,
+    emptyDocument: emptyDocument,
+    hasTailnetConfig: hasTailnetConfig,
+    configForTailnet: configForTailnet,
+    withTailnetRules: withTailnetRules,
+    serializeDocument: serializeDocument
   }
 }

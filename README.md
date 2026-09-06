@@ -82,18 +82,42 @@ Edits apply immediately — no restart.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "defaultUser": "you",
   "sshArgs": ["-o", "ServerAliveInterval=30"],
-  "rules": [
-    { "prefix": "app-", "user": "ubuntu", "group": "App tier" },
-    { "prefix": "app-worker-", "group": "Workers" },
-    { "tag": "role-db", "user": "postgres" },
-    { "regex": "^db-\\d+$", "port": 2222 },
-    { "host": "desktop", "user": "chris", "label": "Desktop", "group": "Home" }
-  ]
+  "tailnets": {
+    "tailabc123.ts.net": {
+      "name": "acme.com",
+      "rules": [
+        { "prefix": "app-", "user": "ubuntu", "group": "App tier" },
+        { "prefix": "app-worker-", "group": "Workers" },
+        { "tag": "role-db", "user": "postgres" },
+        { "regex": "^db-\\d+$", "port": 2222 },
+        { "host": "desktop", "user": "chris", "label": "Desktop", "group": "Home" }
+      ]
+    }
+  }
 }
 ```
+
+### More than one Tailscale account
+
+Rules live under `tailnets`, keyed by the tailnet's MagicDNS suffix. Switching
+accounts changes the machines completely, so rules written for one tailnet would
+be meaningless — and actively misleading — on another.
+
+Switch to a tailnet the plugin has not seen, and the panel says so and offers to
+set it up. Running setup adds a section for that tailnet and **leaves every other
+section untouched**, so you can keep one configuration per account and switch
+freely.
+
+`defaultUser` and `sshArgs` at the top level apply everywhere; a tailnet can
+override `defaultUser` and adds to `sshArgs`.
+
+The key is the MagicDNS suffix rather than the account name because it is unique,
+survives a tailnet rename, and is readable from an unprivileged
+`tailscale status`. Listing accounts (`tailscale switch --list`) needs root or an
+operator grant, so the plugin never depends on it.
 
 ### How rules combine
 
