@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.diddado.tailscale-ssh",
+  "name": "Tailscale SSH",
+  "version": "1.0.0",
+  "author": "Chris Miller",
+  "license": "MIT",
+  "description": "Browse your tailnet and open an SSH terminal to any machine, with the login user resolved per host, tag, regex, or hostname prefix.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Tailscale SSH",
+    "description": "Filterable list of tailnet machines with one-click SSH into each.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 30,
+      "configPath": "",
+      "connectVia": "dns",
+      "showOffline": true,
+      "focusFilterOnOpen": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 30
+      },
+      {
+        "key": "configPath",
+        "type": "path",
+        "label": "Rules file",
+        "description": "Leave empty for the default under ~/.local/state/omarchy/settings/.",
+        "defaultValue": ""
+      },
+      {
+        "key": "connectVia",
+        "type": "enum",
+        "label": "Connect using",
+        "options": ["dns", "ip", "hostname"],
+        "defaultValue": "dns"
+      },
+      {
+        "key": "showOffline",
+        "type": "boolean",
+        "label": "Show offline machines",
+        "defaultValue": true
+      },
+      {
+        "key": "focusFilterOnOpen",
+        "type": "boolean",
+        "label": "Focus the filter box on open",
+        "defaultValue": true
+      }
+    ]
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "BackendState": "Running",
+  "MagicDNSSuffix": "example-net.ts.net",
+  "CurrentTailnet": {
+    "Name": "example.com"
+  },
+  "Self": {
+    "HostName": "workstation",
+    "DNSName": "workstation.example-net.ts.net."
+  },
+  "Peer": {
+    "nodekey:a": {
+      "HostName": "desktop",
+      "DNSName": "desktop.example-net.ts.net.",
+      "TailscaleIPs": [
+        "100.64.0.1"
+      ],
+      "Online": true,
+      "OS": "linux",
+      "Tags": []
+    },
+    "nodekey:m": {
+      "HostName": "mullvad-se",
+      "DNSName": "se.mullvad.ts.net.",
+      "TailscaleIPs": [
+        "100.64.0.9"
+      ],
+      "Online": true,
+      "OS": "linux",
+      "Tags": [
+        "tag:mullvad"
+      ]
+    }
+  }
+}

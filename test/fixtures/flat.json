@@ -1,0 +1,43 @@
+{
+  "BackendState": "Running",
+  "MagicDNSSuffix": "example-net.ts.net",
+  "CurrentTailnet": {
+    "Name": "example.com"
+  },
+  "Self": {
+    "HostName": "workstation",
+    "DNSName": "workstation.example-net.ts.net."
+  },
+  "Peer": {
+    "nodekey:a": {
+      "HostName": "desktop",
+      "DNSName": "desktop.example-net.ts.net.",
+      "TailscaleIPs": [
+        "100.64.0.1"
+      ],
+      "Online": true,
+      "OS": "linux",
+      "Tags": []
+    },
+    "nodekey:b": {
+      "HostName": "nas",
+      "DNSName": "nas.example-net.ts.net.",
+      "TailscaleIPs": [
+        "100.64.0.1"
+      ],
+      "Online": true,
+      "OS": "linux",
+      "Tags": []
+    },
+    "nodekey:c": {
+      "HostName": "router",
+      "DNSName": "router.example-net.ts.net.",
+      "TailscaleIPs": [
+        "100.64.0.1"
+      ],
+      "Online": true,
+      "OS": "linux",
+      "Tags": []
+    }
+  }
+}

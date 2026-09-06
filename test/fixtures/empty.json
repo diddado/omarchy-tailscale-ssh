@@ -1,0 +1,12 @@
+{
+  "BackendState": "Running",
+  "MagicDNSSuffix": "example-net.ts.net",
+  "CurrentTailnet": {
+    "Name": "example.com"
+  },
+  "Self": {
+    "HostName": "workstation",
+    "DNSName": "workstation.example-net.ts.net."
+  },
+  "Peer": {}
+}

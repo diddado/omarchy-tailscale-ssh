@@ -1,0 +1,294 @@
+#!/bin/bash
+
+# omarchy:summary=Generate Tailscale SSH rules from the machines on your tailnet
+# omarchy:args=[--print] [--yes] [--status-file <file>] [--output <file>]
+
+# Builds a starter rules file by looking at what is actually on your tailnet:
+# clusters machine names into prefixes, spots the ones whose names are generated
+# (and so must be matched by prefix, never by hostname), and picks up ACL tags.
+#
+# It never guesses a username. Every rule is written with the user left unset so
+# it inherits defaultUser, and the interactive wizard asks you per group. A
+# guessed "ubuntu" that happens to be wrong is worse than a blank you were asked
+# to fill in.
+
+set -euo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/settings"
+OUTPUT="$STATE_DIR/io.github.diddado.tailscale-ssh.json"
+STATUS_FILE=""
+PRINT_ONLY=false
+ASSUME_YES=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --print) PRINT_ONLY=true; shift ;;
+  --yes | -y) ASSUME_YES=true; shift ;;
+  --status-file) STATUS_FILE="${2-}"; shift 2 ;;
+  --status-file=*) STATUS_FILE="${1#*=}"; shift ;;
+  --output) OUTPUT="${2-}"; shift 2 ;;
+  --output=*) OUTPUT="${1#*=}"; shift ;;
+  -h | --help)
+    cat <<'USAGE'
+Usage: setup [--print] [--yes] [--status-file <file>] [--output <file>]
+
+  --print              Write the suggested config to stdout and exit.
+  --yes                Accept every suggestion; do not prompt.
+  --status-file FILE   Read `tailscale status --json` output from FILE.
+  --output FILE        Write somewhere other than the default config path.
+
+With no flags it runs an interactive wizard and writes the config file.
+USAGE
+    exit 0
+    ;;
+  *)
+    echo "setup: unknown option '$1'. Try --help." >&2
+    exit 2
+    ;;
+  esac
+done
+
+command -v jq >/dev/null || { echo "setup: jq is required" >&2; exit 1; }
+
+read_status() {
+  if [[ -n $STATUS_FILE ]]; then
+    [[ -f $STATUS_FILE ]] || { echo "setup: no such file: $STATUS_FILE" >&2; exit 1; }
+    cat "$STATUS_FILE"
+  else
+    command -v tailscale >/dev/null || { echo "setup: the tailscale CLI is not on PATH" >&2; exit 1; }
+    tailscale status --json
+  fi
+}
+
+STATUS="$(read_status)"
+
+# hostname<TAB>tag,tag — Mullvad exit nodes are not machines you ssh into.
+PEERS="$(jq -r '
+  (.Peer // {}) | to_entries[] | .value
+  | select((.Tags // []) | index("tag:mullvad") | not)
+  | select((.DNSName // "") | test("\\.mullvad\\.ts\\.net\\.?$") | not)
+  | "\(.HostName)\t\((.Tags // []) | join(","))"
+' <<<"$STATUS")"
+
+# ---------------------------------------------------------------- ephemeral
+
+# Mirrors EPHEMERAL_TAIL in Model.js. A machine whose name ends in a generated
+# id is replaced rather than restarted, so its hostname is worthless as a
+# matcher — the stable prefix is the only durable handle.
+stable_prefix() {
+  local host="$1" IFS='-'
+  read -r -a tokens <<<"$host"
+  local i joined
+  for ((i = 1; i < ${#tokens[@]}; i++)); do
+    joined="$(IFS='-'; echo "${tokens[*]:i}")"
+    if [[ $joined =~ ^(i-)?[0-9a-f]{8,}$ || $joined =~ ^[0-9a-z]{12,}$ ]]; then
+      (IFS='-'; echo "${tokens[*]:0:i}-")
+      return 0
+    fi
+  done
+  echo ""
+}
+
+# ---------------------------------------------------------------- clustering
+
+declare -A PREFIX_COUNT=() PREFIX_EPHEMERAL=() TAG_COUNT=()
+HOSTS=()
+
+while IFS=$'\t' read -r host tags; do
+  [[ -n $host ]] || continue
+  HOSTS+=("$host")
+
+  eph="$(stable_prefix "$host")"
+  if [[ -n $eph ]]; then
+    # An ephemeral machine earns a prefix rule even when it is currently the
+    # only one of its kind — tomorrow it will have a different name.
+    PREFIX_COUNT["$eph"]=$(( ${PREFIX_COUNT["$eph"]:-0} + 1 ))
+    PREFIX_EPHEMERAL["$eph"]=1
+  else
+    # Otherwise consider every token boundary as a candidate prefix; those
+    # covering two or more machines are worth a rule.
+    acc=""
+    IFS='-' read -r -a toks <<<"$host"
+    for ((i = 0; i < ${#toks[@]} - 1; i++)); do
+      acc+="${toks[i]}-"
+      PREFIX_COUNT["$acc"]=$(( ${PREFIX_COUNT["$acc"]:-0} + 1 ))
+    done
+  fi
+
+  if [[ -n $tags ]]; then
+    IFS=',' read -r -a taglist <<<"$tags"
+    for t in "${taglist[@]}"; do
+      [[ -n $t ]] && TAG_COUNT["$t"]=$(( ${TAG_COUNT["$t"]:-0} + 1 ))
+    done
+  fi
+done <<<"$PEERS"
+
+# Keep a prefix if it is ephemeral, or covers >=2 machines. Then drop any prefix
+# that covers exactly the same machines as a longer one — the longer name is
+# more descriptive and longest-prefix-wins makes the short one redundant.
+KEPT=()
+for p in "${!PREFIX_COUNT[@]}"; do
+  [[ -n ${PREFIX_EPHEMERAL[$p]:-} || ${PREFIX_COUNT[$p]} -ge 2 ]] || continue
+  redundant=false
+  for q in "${!PREFIX_COUNT[@]}"; do
+    [[ $q != "$p" && $q == "$p"* && ${PREFIX_COUNT[$q]} -eq ${PREFIX_COUNT[$p]} ]] && redundant=true && break
+  done
+  $redundant || KEPT+=("$p")
+done
+mapfile -t KEPT < <(printf '%s\n' "${KEPT[@]}" | grep -v '^$' | sort)
+
+# Machines not covered by any kept prefix get an exact-host stub.
+STUBS=()
+for h in "${HOSTS[@]}"; do
+  covered=false
+  for p in "${KEPT[@]}"; do [[ $h == "$p"* ]] && covered=true && break; done
+  $covered || STUBS+=("$h")
+done
+
+# Tags on two or more machines are worth a rule of their own.
+TAGS=()
+for t in "${!TAG_COUNT[@]}"; do
+  [[ ${TAG_COUNT[$t]} -ge 2 ]] && TAGS+=("$t")
+done
+mapfile -t TAGS < <(printf '%s\n' "${TAGS[@]}" | grep -v '^$' | sort)
+
+# ---------------------------------------------------------------- labels
+
+title_case() {
+  echo "$1" | tr -- '-_' '  ' | sed -E 's/^ +| +$//g; s/\b(.)/\u\1/g'
+}
+
+group_for_prefix() { title_case "${1%-}"; }
+group_for_tag() { title_case "${1#tag:}"; }
+
+# ---------------------------------------------------------------- assemble
+
+# rule_user["<kind>\t<value>"] is filled in by the wizard; empty means inherit.
+declare -A RULE_USER=()
+declare -A PREFIX_LOOSE_KEYS=()
+DEFAULT_USER="${USER:-$(id -un)}"
+
+emit_config() {
+  local rules="[]" p t h group user args
+
+  for p in "${KEPT[@]}"; do
+    [[ -n $p ]] || continue
+    group="$(group_for_prefix "$p")"
+    user="${RULE_USER["prefix	$p"]:-}"
+    args="[]"
+    # A fleet with generated names re-uses addresses, so a pinned host key will
+    # eventually mismatch and block the connection.
+    [[ -n ${PREFIX_EPHEMERAL[$p]:-} && -n ${PREFIX_LOOSE_KEYS[$p]:-} ]] &&
+      args='["-o","StrictHostKeyChecking=accept-new","-o","UserKnownHostsFile=/dev/null"]'
+    rules="$(jq -c --arg prefix "$p" --arg group "$group" --arg user "$user" --argjson args "$args" \
+      '. + [ ({prefix: $prefix, group: $group}
+             + (if $user == "" then {} else {user: $user} end)
+             + (if ($args | length) == 0 then {} else {sshArgs: $args} end)) ]' <<<"$rules")"
+  done
+
+  for t in "${TAGS[@]}"; do
+    [[ -n $t ]] || continue
+    group="$(group_for_tag "$t")"
+    user="${RULE_USER["tag	$t"]:-}"
+    rules="$(jq -c --arg tag "$t" --arg group "$group" --arg user "$user" \
+      '. + [ ({tag: $tag, group: $group}
+             + (if $user == "" then {} else {user: $user} end)) ]' <<<"$rules")"
+  done
+
+  for h in "${STUBS[@]}"; do
+    [[ -n $h ]] || continue
+    user="${RULE_USER["host	$h"]:-}"
+    rules="$(jq -c --arg host "$h" --arg user "$user" \
+      '. + [ ({host: $host}
+             + (if $user == "" then {} else {user: $user} end)) ]' <<<"$rules")"
+  done
+
+  jq -n --arg defaultUser "$DEFAULT_USER" --argjson rules "$rules" '{
+    version: 1,
+    defaultUser: $defaultUser,
+    sshArgs: ["-o", "ServerAliveInterval=30"],
+    rules: $rules
+  }'
+}
+
+if $PRINT_ONLY; then
+  emit_config
+  exit 0
+fi
+
+# ---------------------------------------------------------------- wizard
+
+have_gum() { command -v gum >/dev/null; }
+
+say() { if have_gum; then gum style --foreground 212 "$1"; else echo "$1"; fi; }
+note() { if have_gum; then gum style --foreground 244 "  $1"; else echo "  $1"; fi; }
+
+ask_user() {
+  local label="$1" placeholder="$2"
+  if $ASSUME_YES || ! have_gum; then echo ""; return; fi
+  gum input --placeholder "$placeholder" --prompt "  SSH user for $label > "
+}
+
+ask_yes() {
+  local prompt="$1"
+  $ASSUME_YES && return 0
+  have_gum || return 1
+  gum confirm "$prompt"
+}
+
+total=$(( ${#KEPT[@]} + ${#TAGS[@]} + ${#STUBS[@]} ))
+if [[ $total -eq 0 ]]; then
+  echo "No machines found on the tailnet. Is Tailscale connected?" >&2
+  exit 1
+fi
+
+say "Found $(printf '%s' "${#HOSTS[@]}") machines on your tailnet."
+echo
+say "Groups detected"
+for p in "${KEPT[@]}"; do
+  [[ -n $p ]] || continue
+  if [[ -n ${PREFIX_EPHEMERAL[$p]:-} ]]; then
+    note "$p*  ${PREFIX_COUNT[$p]} machine(s), names are generated"
+  else
+    note "$p*  ${PREFIX_COUNT[$p]} machines"
+  fi
+done
+for t in "${TAGS[@]}"; do [[ -n $t ]] && note "$t  ${TAG_COUNT[$t]} machines"; done
+for h in "${STUBS[@]}"; do [[ -n $h ]] && note "$h"; done
+echo
+note "Leave a user blank to inherit the default ($DEFAULT_USER)."
+echo
+
+for p in "${KEPT[@]}"; do
+  [[ -n $p ]] || continue
+  RULE_USER["prefix	$p"]="$(ask_user "$p*" "e.g. ubuntu")"
+  if [[ -n ${PREFIX_EPHEMERAL[$p]:-} ]]; then
+    if ask_yes "  $p* names are generated. Skip host-key checking for them?"; then
+      PREFIX_LOOSE_KEYS["$p"]=1
+    fi
+  fi
+done
+for t in "${TAGS[@]}"; do
+  [[ -n $t ]] || continue
+  RULE_USER["tag	$t"]="$(ask_user "$t" "blank to inherit")"
+done
+for h in "${STUBS[@]}"; do
+  [[ -n $h ]] || continue
+  RULE_USER["host	$h"]="$(ask_user "$h" "blank to inherit")"
+done
+
+mkdir -p "$(dirname "$OUTPUT")"
+if [[ -f $OUTPUT ]]; then
+  backup="$OUTPUT.bak.$(date -u +%Y%m%d%H%M%S)"
+  cp "$OUTPUT" "$backup"
+  note "Existing config backed up to $backup"
+fi
+
+tmp="$(mktemp)"
+emit_config >"$tmp"
+mv "$tmp" "$OUTPUT"
+
+echo
+say "Wrote $OUTPUT"
+note "The panel picks this up immediately — no restart needed."
+note "Edit it any time from the panel, or with: \$EDITOR $OUTPUT"

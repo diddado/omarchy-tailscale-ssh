@@ -1,0 +1,71 @@
+{
+  "BackendState": "Running",
+  "MagicDNSSuffix": "example-net.ts.net",
+  "CurrentTailnet": {
+    "Name": "example.com"
+  },
+  "Self": {
+    "HostName": "workstation",
+    "DNSName": "workstation.example-net.ts.net."
+  },
+  "Peer": {
+    "nodekey:a": {
+      "HostName": "app-worker-i-0b1e031df86719510",
+      "DNSName": "app-worker-i-0b1e031df86719510.example-net.ts.net.",
+      "TailscaleIPs": [
+        "100.64.0.1"
+      ],
+      "Online": true,
+      "OS": "linux",
+      "Tags": [
+        "tag:role-worker"
+      ]
+    },
+    "nodekey:b": {
+      "HostName": "app-worker-i-06f8e962059c3d7a3",
+      "DNSName": "app-worker-i-06f8e962059c3d7a3.example-net.ts.net.",
+      "TailscaleIPs": [
+        "100.64.0.1"
+      ],
+      "Online": false,
+      "OS": "linux",
+      "Tags": [
+        "tag:role-worker"
+      ]
+    },
+    "nodekey:c": {
+      "HostName": "app-worker-i-0ba42419e05b78a63",
+      "DNSName": "app-worker-i-0ba42419e05b78a63.example-net.ts.net.",
+      "TailscaleIPs": [
+        "100.64.0.1"
+      ],
+      "Online": true,
+      "OS": "linux",
+      "Tags": [
+        "tag:role-worker"
+      ]
+    },
+    "nodekey:d": {
+      "HostName": "media-encoder-i-03a09331616e96f5d",
+      "DNSName": "media-encoder-i-03a09331616e96f5d.example-net.ts.net.",
+      "TailscaleIPs": [
+        "100.64.0.1"
+      ],
+      "Online": true,
+      "OS": "linux",
+      "Tags": [
+        "tag:role-encoder"
+      ]
+    },
+    "nodekey:e": {
+      "HostName": "desktop",
+      "DNSName": "desktop.example-net.ts.net.",
+      "TailscaleIPs": [
+        "100.64.0.1"
+      ],
+      "Online": true,
+      "OS": "linux",
+      "Tags": []
+    }
+  }
+}

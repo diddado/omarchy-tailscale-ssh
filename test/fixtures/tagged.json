@@ -1,0 +1,62 @@
+{
+  "BackendState": "Running",
+  "MagicDNSSuffix": "example-net.ts.net",
+  "CurrentTailnet": {
+    "Name": "example.com"
+  },
+  "Self": {
+    "HostName": "workstation",
+    "DNSName": "workstation.example-net.ts.net."
+  },
+  "Peer": {
+    "nodekey:a": {
+      "HostName": "app-primary",
+      "DNSName": "app-primary.example-net.ts.net.",
+      "TailscaleIPs": [
+        "100.64.0.1"
+      ],
+      "Online": true,
+      "OS": "linux",
+      "Tags": [
+        "tag:role-app",
+        "tag:role-primary"
+      ]
+    },
+    "nodekey:b": {
+      "HostName": "app-secondary",
+      "DNSName": "app-secondary.example-net.ts.net.",
+      "TailscaleIPs": [
+        "100.64.0.1"
+      ],
+      "Online": true,
+      "OS": "linux",
+      "Tags": [
+        "tag:role-app"
+      ]
+    },
+    "nodekey:c": {
+      "HostName": "app-cache",
+      "DNSName": "app-cache.example-net.ts.net.",
+      "TailscaleIPs": [
+        "100.64.0.1"
+      ],
+      "Online": true,
+      "OS": "linux",
+      "Tags": [
+        "tag:role-app"
+      ]
+    },
+    "nodekey:d": {
+      "HostName": "db-primary",
+      "DNSName": "db-primary.example-net.ts.net.",
+      "TailscaleIPs": [
+        "100.64.0.1"
+      ],
+      "Online": true,
+      "OS": "linux",
+      "Tags": [
+        "tag:role-db"
+      ]
+    }
+  }
+}
