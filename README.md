@@ -43,8 +43,8 @@ Requires the `tailscale` CLI, which the plugin looks for at `/usr/bin/tailscale`
 `/usr/local/bin/tailscale` or `/opt/tailscale/tailscale` — absolute paths rather
 than `$PATH`, so another process cannot decide which binary answers. `wl-copy`
 (wl-clipboard) backs the copy actions and `gum` draws the setup wizard; both are
-in Omarchy's base package set. `python3` and `jq` are used by the helpers in
-`bin/` and ship with the system.
+in Omarchy's base package set, as are `jq` and `python3`, which the helpers in
+`bin/` use. Tailscale itself is the one thing you install yourself.
 
 The plugin only ever runs `tailscale status --json`. It never brings the tailnet
 up or down, and it needs no elevated privileges — nothing here uses `sudo` or

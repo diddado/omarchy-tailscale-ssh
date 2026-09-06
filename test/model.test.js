@@ -59,7 +59,7 @@ var CONFIG = {
     { prefix: "app-", user: "ubuntu", group: "App tier" },
     { prefix: "app-worker-", user: "deploy", group: "Workers" },
     { prefix: "media-encoder-", user: "encoder", group: "Media" },
-    { tag: "tag:role-primary", group: "Primaries", command: "systemctl --user status app" },
+    { tag: "tag:role-primary", group: "Primaries", command: "journalctl --user -fu app" },
     { regex: "^app-(primary|secondary)$", sshArgs: ["-o", "StrictHostKeyChecking=accept-new"] },
     { host: "desktop", user: "chris", group: "Home", label: "Desktop" },
     { host: "laptop", user: "deploy", port: 2222, group: "Home" }
@@ -89,7 +89,7 @@ section("tag rules")
 eq(resolve(PEERS.appPrimary).group, "Primaries", "tag rule sets group")
 eq(resolve(PEERS.appPrimary).user, "ubuntu",
    "tag rule leaves the user from the weaker prefix rule intact")
-eq(resolve(PEERS.appPrimary).command, "systemctl --user status app", "tag rule sets a connect command")
+eq(resolve(PEERS.appPrimary).command, "journalctl --user -fu app", "tag rule sets a connect command")
 eq(resolve(PEERS.appSecondary).group, "App tier",
    "a peer with a different tag falls back to the prefix rule's group")
 
@@ -130,7 +130,7 @@ eq(Model.sshArgv(PEERS.laptop, resolve(PEERS.laptop), "org.omarchy.tailssh"),
 eq(Model.sshArgv(PEERS.appPrimary, resolve(PEERS.appPrimary), "org.omarchy.tailssh"),
    ["omarchy-launch-tui", "--app-id=org.omarchy.tailssh-app-primary", "ssh",
     "-o", "ServerAliveInterval=30", "-o", "StrictHostKeyChecking=accept-new",
-    "-t", "--", "ubuntu@app-primary.example-net.ts.net", "systemctl --user status app"],
+    "-t", "--", "ubuntu@app-primary.example-net.ts.net", "journalctl --user -fu app"],
    "a connect command adds -t and trails the command as one argv element")
 
 section("a machine cannot name itself into an ssh option or a shell")
