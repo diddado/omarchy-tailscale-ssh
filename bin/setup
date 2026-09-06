@@ -14,6 +14,37 @@
 
 set -euo pipefail
 
+# Anything this script creates is private by default. Set before the first file
+# is touched, because a chmod afterwards is a window, and it follows a symlink
+# that may have replaced the name in the meantime.
+umask 077
+
+# Absolute paths, never a bare name: PATH is inherited and any other process
+# running as this user can prepend to it.
+JQ=/usr/bin/jq
+DD=/usr/bin/dd
+PYTHON=/usr/bin/python3
+HEAD=/usr/bin/head
+SORT=/usr/bin/sort
+GREP=/usr/bin/grep
+TR=/usr/bin/tr
+SED=/usr/bin/sed
+DATE=/usr/bin/date
+ID=/usr/bin/id
+
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# The one implementation of hardened config I/O, shared with Service.qml: opens
+# once with O_NOFOLLOW|O_NONBLOCK, validates the descriptor it holds, reads a
+# bounded number of bytes from that same descriptor, and publishes a write by
+# renaming a fresh 0600 temporary over the destination.
+STATEFILE="$HERE/statefile"
+
+# Ceilings. `tailscale status --json` describes machines named by whoever owns
+# them, so its size is not this script's to assume.
+MAX_STATUS_BYTES=$((1024 * 1024))
+MAX_PEERS=2000
+MAX_NAME=253
+
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/settings"
 OUTPUT="$STATE_DIR/io.github.diddado.tailscale-ssh.json"
 STATUS_FILE=""
@@ -48,16 +79,40 @@ USAGE
   esac
 done
 
-command -v jq >/dev/null || { echo "setup: jq is required" >&2; exit 1; }
+[[ -x $JQ ]] || { echo "setup: $JQ is required" >&2; exit 1; }
+[[ -x $STATEFILE ]] || { echo "setup: $STATEFILE is missing" >&2; exit 1; }
+
+# One open with O_NOFOLLOW, capped at MAX_STATUS_BYTES + 1 so an overflow is
+# detected rather than silently truncated. A bare `<` redirect does not pass
+# O_NOFOLLOW and `[[ -f ]]` followed by `cat` is two resolutions of one name.
+read_file_bounded() {
+  "$DD" if="$1" iflag=nofollow,nonblock,count_bytes,fullblock \
+    bs=65536 count=$((MAX_STATUS_BYTES + 1)) status=none 2>/dev/null
+}
 
 read_status() {
+  local raw
   if [[ -n $STATUS_FILE ]]; then
-    [[ -f $STATUS_FILE ]] || { echo "setup: no such file: $STATUS_FILE" >&2; exit 1; }
-    cat "$STATUS_FILE"
+    raw="$(read_file_bounded "$STATUS_FILE")" \
+      || { echo "setup: cannot read $STATUS_FILE" >&2; exit 1; }
+    [[ -n $raw ]] || { echo "setup: $STATUS_FILE is empty or not a regular file" >&2; exit 1; }
   else
-    command -v tailscale >/dev/null || { echo "setup: the tailscale CLI is not on PATH" >&2; exit 1; }
-    tailscale status --json
+    # Own session, absolute deadline with KILL escalation, producer-side cap.
+    raw="$("$HERE/tailscale-status")" || {
+      local rc=$?
+      if (( rc == 127 )); then
+        echo "setup: the tailscale CLI was not found" >&2
+      else
+        echo "setup: tailscale status failed (exit $rc); is Tailscale connected?" >&2
+      fi
+      exit 1
+    }
   fi
+  if (( ${#raw} > MAX_STATUS_BYTES )); then
+    echo "setup: status output exceeds ${MAX_STATUS_BYTES} bytes" >&2
+    exit 1
+  fi
+  printf '%s' "$raw"
 }
 
 STATUS="$(read_status)"
@@ -65,8 +120,12 @@ STATUS="$(read_status)"
 # Identify the tailnet. Keyed on MagicDNSSuffix because it is unique, survives a
 # rename, and is readable without root -- unlike `tailscale switch --list`,
 # which needs an operator grant and is commonly denied.
-TAILNET_KEY="$(jq -r '.MagicDNSSuffix // (.CurrentTailnet.MagicDNSSuffix // "") // ""' <<<"$STATUS")"
-TAILNET_NAME="$(jq -r '.CurrentTailnet.Name // ""' <<<"$STATUS")"
+# Both come off the network, so both are stripped of control characters and
+# capped before they are printed or used as a JSON key.
+clean() { printf '%s' "$1" | "$TR" -d '\000-\037\177' | "$HEAD" -c "$MAX_NAME"; }
+
+TAILNET_KEY="$(clean "$("$JQ" -r '.MagicDNSSuffix // (.CurrentTailnet.MagicDNSSuffix // "") // ""' <<<"$STATUS")")"
+TAILNET_NAME="$(clean "$("$JQ" -r '.CurrentTailnet.Name // ""' <<<"$STATUS")")"
 [[ -z $TAILNET_KEY ]] && TAILNET_KEY="$TAILNET_NAME"
 if [[ -z $TAILNET_KEY ]]; then
   echo "setup: could not determine which tailnet this is; is Tailscale connected?" >&2
@@ -74,12 +133,19 @@ if [[ -z $TAILNET_KEY ]]; then
 fi
 
 # hostname<TAB>tag,tag — Mullvad exit nodes are not machines you ssh into.
-PEERS="$(jq -r '
-  (.Peer // {}) | to_entries[] | .value
-  | select((.Tags // []) | index("tag:mullvad") | not)
-  | select((.DNSName // "") | test("\\.mullvad\\.ts\\.net\\.?$") | not)
-  | "\(.HostName)\t\((.Tags // []) | join(","))"
-' <<<"$STATUS")"
+# Capped at MAX_PEERS rows and MAX_NAME characters per name: a tailnet is not
+# obliged to be small, and a hostname is chosen by whoever owns the machine.
+# Control characters are dropped here too -- a name reaches gum, a JSON key and
+# a terminal from this one place.
+PEERS="$("$JQ" -r --argjson max "$MAX_PEERS" --argjson len "$MAX_NAME" '
+  [ (.Peer // {}) | to_entries[] | .value
+    | select((.Tags // []) | index("tag:mullvad") | not)
+    | select((.DNSName // "") | test("\\.mullvad\\.ts\\.net\\.?$") | not)
+  ][:$max][]
+  | ((.HostName // "") | tostring | .[:$len]) as $h
+  | ([ (.Tags // [])[] | tostring | .[:$len] ] | .[:32] | join(",")) as $t
+  | "\($h)\t\($t)"
+' <<<"$STATUS" | "$TR" -d '\000-\010\013\014\016-\037\177')"
 
 # ---------------------------------------------------------------- ephemeral
 
@@ -91,13 +157,13 @@ stable_prefix() {
   read -r -a tokens <<<"$host"
   local i joined
   for ((i = 1; i < ${#tokens[@]}; i++)); do
-    joined="$(IFS='-'; echo "${tokens[*]:i}")"
+    joined="$(IFS='-'; printf '%s' "${tokens[*]:i}")"
     if [[ $joined =~ ^(i-)?[0-9a-f]{8,}$ || $joined =~ ^[0-9a-z]{12,}$ ]]; then
-      (IFS='-'; echo "${tokens[*]:0:i}-")
+      (IFS='-'; printf '%s' "${tokens[*]:0:i}-")
       return 0
     fi
   done
-  echo ""
+  printf ''
 }
 
 # ---------------------------------------------------------------- clustering
@@ -146,7 +212,7 @@ for p in "${!PREFIX_COUNT[@]}"; do
   done
   $redundant || KEPT+=("$p")
 done
-mapfile -t KEPT < <(printf '%s\n' "${KEPT[@]}" | grep -v '^$' | sort)
+mapfile -t KEPT < <(printf '%s\n' "${KEPT[@]}" | "$GREP" -v '^$' | "$SORT")
 
 # Machines not covered by any kept prefix get an exact-host stub.
 STUBS=()
@@ -161,12 +227,12 @@ TAGS=()
 for t in "${!TAG_COUNT[@]}"; do
   [[ ${TAG_COUNT[$t]} -ge 2 ]] && TAGS+=("$t")
 done
-mapfile -t TAGS < <(printf '%s\n' "${TAGS[@]}" | grep -v '^$' | sort)
+mapfile -t TAGS < <(printf '%s\n' "${TAGS[@]}" | "$GREP" -v '^$' | "$SORT")
 
 # ---------------------------------------------------------------- labels
 
 title_case() {
-  echo "$1" | tr -- '-_' '  ' | sed -E 's/^ +| +$//g; s/\b(.)/\u\1/g'
+  printf '%s' "$1" | "$TR" -- '-_' '  ' | "$SED" -E 's/^ +| +$//g; s/\b(.)/\u\1/g'
 }
 
 group_for_prefix() { title_case "${1%-}"; }
@@ -177,7 +243,7 @@ group_for_tag() { title_case "${1#tag:}"; }
 # rule_user["<kind>\t<value>"] is filled in by the wizard; empty means inherit.
 declare -A RULE_USER=()
 declare -A PREFIX_LOOSE_KEYS=()
-DEFAULT_USER="${USER:-$(id -un)}"
+DEFAULT_USER="${USER:-$("$ID" -un)}"
 
 # The reference written into the top of the config as "_readme", so anyone
 # editing the JSON has the options in front of them. Kept identical to
@@ -240,7 +306,7 @@ emit_config() {
     # eventually mismatch and block the connection.
     [[ -n ${PREFIX_EPHEMERAL[$p]:-} && -n ${PREFIX_LOOSE_KEYS[$p]:-} ]] &&
       args='["-o","StrictHostKeyChecking=accept-new","-o","UserKnownHostsFile=/dev/null"]'
-    rules="$(jq -c --arg prefix "$p" --arg group "$group" --arg user "$user" --argjson args "$args" \
+    rules="$("$JQ" -c --arg prefix "$p" --arg group "$group" --arg user "$user" --argjson args "$args" \
       '. + [ ({prefix: $prefix, group: $group}
              + (if $user == "" then {} else {user: $user} end)
              + (if ($args | length) == 0 then {} else {sshArgs: $args} end)) ]' <<<"$rules")"
@@ -250,7 +316,7 @@ emit_config() {
     [[ -n $t ]] || continue
     group="$(group_for_tag "$t")"
     user="${RULE_USER["tag	$t"]:-}"
-    rules="$(jq -c --arg tag "$t" --arg group "$group" --arg user "$user" \
+    rules="$("$JQ" -c --arg tag "$t" --arg group "$group" --arg user "$user" \
       '. + [ ({tag: $tag, group: $group}
              + (if $user == "" then {} else {user: $user} end)) ]' <<<"$rules")"
   done
@@ -258,7 +324,7 @@ emit_config() {
   for h in "${STUBS[@]}"; do
     [[ -n $h ]] || continue
     user="${RULE_USER["host	$h"]:-}"
-    rules="$(jq -c --arg host "$h" --arg user "$user" \
+    rules="$("$JQ" -c --arg host "$h" --arg user "$user" \
       '. + [ ({host: $host}
              + (if $user == "" then {} else {user: $user} end)) ]' <<<"$rules")"
   done
@@ -266,12 +332,13 @@ emit_config() {
   # Merge into the existing document so other tailnets survive. A v1 file (flat
   # `rules`) is migrated by attributing its rules to the tailnet connected now,
   # which is the only tailnet they could have been written for.
-  local existing='{}'
-  if [[ -s $OUTPUT ]] && jq -e 'type == "object"' "$OUTPUT" >/dev/null 2>&1; then
-    existing="$(cat "$OUTPUT")"
+  local existing='{}' current
+  current="$(read_config)" || current=""
+  if [[ -n $current ]] && "$JQ" -e 'type == "object"' >/dev/null 2>&1 <<<"$current"; then
+    existing="$current"
   fi
 
-  jq -n --arg defaultUser "$DEFAULT_USER" --argjson rules "$rules" \
+  "$JQ" -n --arg defaultUser "$DEFAULT_USER" --argjson rules "$rules" \
     --argjson readme "$CONFIG_HELP_JSON" --argjson existing "$existing" \
     --arg key "$TAILNET_KEY" --arg name "$TAILNET_NAME" '
     ($existing | if (.tailnets | type) == "object" then .tailnets else {} end) as $known
@@ -290,6 +357,23 @@ emit_config() {
          then { rules: $existing.rules } else {} end)'
 }
 
+# Reads and writes go through bin/statefile so this script and the panel share
+# one implementation: a single O_NOFOLLOW|O_NONBLOCK open validated on the
+# descriptor it returns, and a publish that renames a fresh 0600 temporary over
+# the destination rather than truncating a name a symlink may have claimed.
+# Exit 3 from the helper means "not there yet", which is not an error here.
+read_config() {
+  local out rc
+  out="$("$PYTHON" -I "$STATEFILE" read "$OUTPUT")" && { printf '%s' "$out"; return 0; }
+  rc=$?
+  (( rc == 3 )) && return 0
+  return "$rc"
+}
+
+write_config() {
+  "$PYTHON" -I "$STATEFILE" write "$OUTPUT"
+}
+
 if $PRINT_ONLY; then
   emit_config
   exit 0
@@ -297,22 +381,31 @@ fi
 
 # ---------------------------------------------------------------- wizard
 
-have_gum() { command -v gum >/dev/null; }
+# gum only draws the wizard -- it never receives a secret and never decides
+# anything -- but it is still resolved to an absolute path rather than through
+# an inherited PATH.
+GUM=/usr/bin/gum
+have_gum() { [[ -x $GUM ]]; }
 
-say() { if have_gum; then gum style --foreground 212 "$1"; else echo "$1"; fi; }
-note() { if have_gum; then gum style --foreground 244 "  $1"; else echo "  $1"; fi; }
+# `--` before every data argument: a group label derived from a hostname can
+# begin with a dash, and gum would read that as an option.
+say() { if have_gum; then "$GUM" style --foreground 212 -- "$1"; else printf '%s\n' "$1"; fi; }
+note() { if have_gum; then "$GUM" style --foreground 244 -- "  $1"; else printf '  %s\n' "$1"; fi; }
 
 ask_user() {
   local label="$1" placeholder="$2"
-  if $ASSUME_YES || ! have_gum; then echo ""; return; fi
-  gum input --placeholder "$placeholder" --prompt "  SSH user for $label > "
+  if $ASSUME_YES || ! have_gum; then printf ''; return; fi
+  # The answer is bounded here rather than trusted: it becomes an ssh login
+  # user, and Model.js refuses one that does not validate.
+  "$GUM" input --placeholder "$placeholder" --prompt "  SSH user for $label > " \
+    | "$TR" -cd 'A-Za-z0-9._-' | "$HEAD" -c 32
 }
 
 ask_yes() {
   local prompt="$1"
   $ASSUME_YES && return 0
   have_gum || return 1
-  gum confirm "$prompt"
+  "$GUM" confirm -- "$prompt"
 }
 
 total=$(( ${#KEPT[@]} + ${#TAGS[@]} + ${#STUBS[@]} ))
@@ -323,7 +416,8 @@ fi
 
 say "Tailnet: ${TAILNET_NAME:-$TAILNET_KEY}"
 say "Found $(printf '%s' "${#HOSTS[@]}") machines on it."
-if [[ -s $OUTPUT ]] && jq -e --arg k "$TAILNET_KEY" '.tailnets[$k] // empty' "$OUTPUT" >/dev/null 2>&1; then
+existing_now="$(read_config)" || existing_now=""
+if [[ -n $existing_now ]] && "$JQ" -e --arg k "$TAILNET_KEY" '.tailnets[$k] // empty' >/dev/null 2>&1 <<<"$existing_now"; then
   note "This tailnet already has rules; they will be replaced."
   note "Rules for your other tailnets are not touched."
 fi
@@ -361,16 +455,23 @@ for h in "${STUBS[@]}"; do
   RULE_USER["host	$h"]="$(ask_user "$h" "blank to inherit")"
 done
 
-mkdir -p "$(dirname "$OUTPUT")"
-if [[ -f $OUTPUT ]]; then
-  backup="$OUTPUT.bak.$(date -u +%Y%m%d%H%M%S)"
-  cp "$OUTPUT" "$backup"
-  note "Existing config backed up to $backup"
+# The backup is written the same way the config is -- through the helper, into
+# a fresh 0600 file published by rename -- rather than with `cp`, which creates
+# it under the ambient umask and follows a symlink planted on the name. The
+# state directory is created by the helper, walking the chain with held
+# descriptors, so there is no `mkdir -p` on a path this script then trusts.
+existing_doc="$(read_config)" || existing_doc=""
+if [[ -n $existing_doc ]]; then
+  backup="$OUTPUT.bak.$("$DATE" -u +%Y%m%d%H%M%S)"
+  if OUTPUT="$backup" write_config <<<"$existing_doc"; then
+    note "Existing config backed up to $backup"
+  else
+    note "Could not write a backup; the existing config is left in place."
+    exit 1
+  fi
 fi
 
-tmp="$(mktemp)"
-emit_config >"$tmp"
-mv "$tmp" "$OUTPUT"
+emit_config | write_config
 
 echo
 say "Wrote $OUTPUT"

@@ -59,7 +59,7 @@ var CONFIG = {
     { prefix: "app-", user: "ubuntu", group: "App tier" },
     { prefix: "app-worker-", user: "deploy", group: "Workers" },
     { prefix: "media-encoder-", user: "encoder", group: "Media" },
-    { tag: "tag:role-primary", group: "Primaries", command: "sudo systemctl status app" },
+    { tag: "tag:role-primary", group: "Primaries", command: "systemctl --user status app" },
     { regex: "^app-(primary|secondary)$", sshArgs: ["-o", "StrictHostKeyChecking=accept-new"] },
     { host: "desktop", user: "chris", group: "Home", label: "Desktop" },
     { host: "laptop", user: "deploy", port: 2222, group: "Home" }
@@ -89,7 +89,7 @@ section("tag rules")
 eq(resolve(PEERS.appPrimary).group, "Primaries", "tag rule sets group")
 eq(resolve(PEERS.appPrimary).user, "ubuntu",
    "tag rule leaves the user from the weaker prefix rule intact")
-eq(resolve(PEERS.appPrimary).command, "sudo systemctl status app", "tag rule sets a connect command")
+eq(resolve(PEERS.appPrimary).command, "systemctl --user status app", "tag rule sets a connect command")
 eq(resolve(PEERS.appSecondary).group, "App tier",
    "a peer with a different tag falls back to the prefix rule's group")
 
@@ -121,23 +121,98 @@ eq(Model.resolveAddress(PEERS.desktop, "hostname"), "desktop", "connectVia hostn
 section("argv construction")
 eq(Model.sshArgv(PEERS.desktop, resolve(PEERS.desktop), "org.omarchy.tailssh"),
    ["omarchy-launch-tui", "--app-id=org.omarchy.tailssh-desktop", "ssh",
-    "-o", "ServerAliveInterval=30", "chris@desktop.example-net.ts.net"],
-   "plain login builds a flat argv vector")
+    "-o", "ServerAliveInterval=30", "--", "chris@desktop.example-net.ts.net"],
+   "plain login builds a flat argv vector, destination after --")
 eq(Model.sshArgv(PEERS.laptop, resolve(PEERS.laptop), "org.omarchy.tailssh"),
    ["omarchy-launch-tui", "--app-id=org.omarchy.tailssh-laptop", "ssh",
-    "-p", "2222", "-o", "ServerAliveInterval=30", "deploy@laptop.example-net.ts.net"],
+    "-p", "2222", "-o", "ServerAliveInterval=30", "--", "deploy@laptop.example-net.ts.net"],
    "a port lands as a separate -p argument")
 eq(Model.sshArgv(PEERS.appPrimary, resolve(PEERS.appPrimary), "org.omarchy.tailssh"),
    ["omarchy-launch-tui", "--app-id=org.omarchy.tailssh-app-primary", "ssh",
     "-o", "ServerAliveInterval=30", "-o", "StrictHostKeyChecking=accept-new",
-    "-t", "ubuntu@app-primary.example-net.ts.net", "sudo systemctl status app"],
+    "-t", "--", "ubuntu@app-primary.example-net.ts.net", "systemctl --user status app"],
    "a connect command adds -t and trails the command as one argv element")
 
-section("shell metacharacters stay inert")
-var evil = peer("evil$(id)host")
-var evilArgv = Model.sshArgv(evil, Model.resolveTarget(evil, { fallbackUser: "localuser", rules: [] }), "x")
-eq(evilArgv[evilArgv.length - 1], "localuser@evil$(id)host.example-net.ts.net",
-   "a hostname with shell syntax stays a single literal argv element")
+section("a machine cannot name itself into an ssh option or a shell")
+// Hostnames are chosen by whoever owns the machine, so they are the input this
+// plugin trusts least. Each of these is refused outright rather than quoted:
+// ssh reads argv with getopt, so "-oProxyCommand=..." in the destination slot
+// is a command, and a repaired hostname would connect somewhere unintended.
+function targetFor(name, extra) {
+  var p = peer(name)
+  var cfg = { fallbackUser: "localuser", rules: extra || [] }
+  return { peer: p, target: Model.resolveTarget(p, cfg) }
+}
+
+var evil = targetFor("evil$(id)host")
+eq(Model.sshArgv(evil.peer, evil.target, "x"), [],
+   "a hostname with shell syntax is refused, not quoted")
+eq(evil.target.problem !== "", true, "and the panel is told why")
+eq(Model.sshCommandText(evil.peer, evil.target), "",
+   "there is no ssh command text to copy for a refused target")
+
+var dashHost = targetFor("x", [{ prefix: "x", address: "-oProxyCommand=curl evil.example" }])
+eq(Model.sshArgv(dashHost.peer, dashHost.target, "x"), [],
+   "an address that is really an ssh option is refused")
+
+var dashUser = targetFor("x", [{ prefix: "x", user: "-oProxyCommand=id" }])
+eq(Model.sshArgv(dashUser.peer, dashUser.target, "x"), [],
+   "a login user that is really an ssh option is refused")
+
+var spaced = targetFor("host -e touch /tmp/pwned")
+eq(Model.sshArgv(spaced.peer, spaced.target, "x"), [],
+   "a hostname carrying a space and a flag is refused outright")
+
+// omarchy-launch-tui expands --app-id=$APP_ID unquoted, so the window id may
+// carry nothing that can word-split or glob -- even for a hostname that is
+// otherwise a perfectly legal ssh destination.
+var bracketed = targetFor("a:b[c]")
+var bracketArgv = Model.sshArgv(bracketed.peer, bracketed.target, "org.omarchy.tailssh")
+eq(bracketArgv.length > 0, true, "a bracketed name is still a usable destination")
+eq(/^--app-id=[A-Za-z0-9._-]+$/.test(bracketArgv[1]), true,
+   "but the window id it produces cannot word-split or glob")
+
+// Clamping happens where the JSON is parsed, so this goes through parseStatus.
+var controlStatus = Model.parseStatus(JSON.stringify({
+  BackendState: "Running",
+  Peer: { a: { HostName: "host\u0007\u202ename", Online: true } }
+}))
+eq(/[\u0000-\u001f\u202a-\u202e]/.test(controlStatus.peers[0].HostName), false,
+   "control and bidi characters are stripped from a hostname on the way in")
+
+section("bounds hold after the byte cap")
+var many = { BackendState: "Running", MagicDNSSuffix: "example-net.ts.net", Peer: {} }
+for (var b = 0; b < 3000; b++) {
+  many.Peer["k" + b] = { HostName: "h" + b, DNSName: "h" + b + ".example-net.ts.net.", Online: true }
+}
+var bounded = Model.parseStatus(JSON.stringify(many))
+eq(bounded.peers.length, 2000, "the peer list stops at the ceiling")
+eq(bounded.truncated, true, "and says that it did")
+
+var longName = Model.parseStatus(JSON.stringify({
+  BackendState: "Running",
+  Peer: { a: { HostName: new Array(5000).join("z"), Online: true } }
+}))
+eq(longName.peers[0].HostName.length <= 512, true, "a single enormous hostname is capped")
+
+var manyTags = Model.parseStatus(JSON.stringify({
+  BackendState: "Running",
+  Peer: { a: { HostName: "t", Online: true, Tags: new Array(500).join(",").split(",").map(function (_, i) { return "tag:" + i }) } }
+}))
+eq(manyTags.peers[0].Tags.length <= 32, true, "a machine cannot advertise unbounded tags")
+
+section("a rules file cannot reach Object.prototype")
+var polluted = Model.parseConfigDocument(JSON.stringify({
+  version: 2,
+  tailnets: { "__proto__": { rules: [{ host: "x", user: "root" }] }, "real.ts.net": { rules: [] } }
+}))
+eq(({}).rules, undefined, "a tailnet named __proto__ does not touch Object.prototype")
+eq(polluted.doc.tailnets["real.ts.net"] !== undefined, true, "the real tailnet still parses")
+
+var pollutedRule = Model.upsertRule([{ "__proto__": "x", host: "a" }],
+                                    { kind: "host", value: "a" }, { user: "root" })
+eq(({}).user, undefined, "upsertRule does not pollute the prototype either")
+eq(Array.isArray(pollutedRule), true, "and still returns a rules array")
 
 section("hidden and filtering")
 var hiddenCfg = { fallbackUser: "localuser", rules: [{ prefix: "old-", hidden: true }] }

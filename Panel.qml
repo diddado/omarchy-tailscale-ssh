@@ -269,10 +269,17 @@ Panel {
           spacing: Style.space(12)
 
           // ------------------------------------------------------ header
+          // PanelHero, PanelSectionHeader and tooltipText are the shell's own
+          // components: they render with Text.AutoText and a plugin cannot pin
+          // them to PlainText. Qt renders a string that looks like markup as
+          // rich text, and rich text loads <img src="...">, which is a real
+          // request out of the shell process to a URL the string's author
+          // chose. The tailnet name and every group name come from the network
+          // or from a file, so each is stripped and capped on the way in.
           PanelHero {
             width: parent.width
-            title: tailssh.tailnetName !== "" ? tailssh.tailnetName : "Tailscale SSH"
-            meta: tailssh.statusText
+            title: tailssh.tailnetName !== "" ? tailssh.plain(tailssh.tailnetName, 64) : "Tailscale SSH"
+            meta: tailssh.plain(tailssh.statusText, 96)
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconOpacity: tailssh.running ? 1.0 : 0.5
@@ -326,7 +333,9 @@ Panel {
             width: parent.width
             textFormat: Text.PlainText
             text: {
-              if (tailssh.rulesError !== "") return "Rules file is not valid JSON \u2014 "
+              if (tailssh.configPathRejected) return "The configPath setting is not an absolute path; "
+                  + "using the default rules file instead."
+              if (tailssh.rulesError !== "") return "Rules file problem \u2014 "
                   + tailssh.rulesError + ". Previous rules are still in use; click the pencil to fix it."
               if (tailssh.actionStatus !== "") return tailssh.actionStatus
               if (tailssh.lastError !== "") return tailssh.lastError
@@ -344,6 +353,9 @@ Panel {
             id: filterField
             width: parent.width
             foreground: root.foreground
+            // Every text entry point carries an explicit ceiling. The filter
+            // string is re-scanned against every machine on every keystroke.
+            maximumLength: 128
             placeholderText: "Filter machines, tags, IPs…"
             text: root.filterQuery
             visible: tailssh.installed && tailssh.running
@@ -419,7 +431,7 @@ Panel {
               width: parent.width
               textFormat: Text.PlainText
               text: tailssh.newTailnet
-                ? "No rules for " + (tailssh.tailnetName !== "" ? tailssh.tailnetName : "this tailnet")
+                ? "No rules for " + (tailssh.tailnetName !== "" ? tailssh.plain(tailssh.tailnetName, 64) : "this tailnet")
                 : "No SSH rules yet"
               color: root.foreground
               font.family: root.fontFamily
@@ -515,7 +527,7 @@ Panel {
               }
 
               PanelSectionHeader {
-                text: section.modelData.name
+                text: tailssh.plain(section.modelData.name, 64)
                 foreground: root.foreground
                 fontFamily: root.fontFamily
               }
@@ -675,7 +687,9 @@ Panel {
       PanelActionButton {
         id: sshButton
         iconText: "󰆍"
-        tooltipText: machineRow.online ? "SSH as " + machineRow.account : "Offline"
+        tooltipText: machineRow.online
+          ? "SSH as " + tailssh.plain(machineRow.account, 64)
+          : "Offline"
         enabled: machineRow.online
         foreground: root.foreground
         fontFamily: root.fontFamily
@@ -720,9 +734,9 @@ Panel {
           var out = []
           for (var i = 0; i < root.editScopes.length; i++) {
             var scope = root.editScopes[i]
-            var text = String(scope.label)
+            var text = tailssh.plain(scope.label, 48)
             if (scope.kind === "host") text = "this machine"
-            else if (scope.kind === "tag") text = String(scope.value).replace(/^tag:/, "")
+            else if (scope.kind === "tag") text = tailssh.plain(String(scope.value).replace(/^tag:/, ""), 48)
             out.push({ value: String(i), label: text })
           }
           return out
@@ -755,6 +769,7 @@ Panel {
           id: userField
           width: (parent.width - Style.space(12)) * 0.44
           foreground: root.foreground
+          maximumLength: 32
           placeholderText: "user (blank = " + tailssh.effectiveDefaultUser + ")"
           verticalPadding: Style.spacing.controlPaddingY
           text: root.editUser
@@ -767,6 +782,7 @@ Panel {
           id: portField
           width: (parent.width - Style.space(12)) * 0.20
           foreground: root.foreground
+          maximumLength: 5
           placeholderText: "port"
           verticalPadding: Style.spacing.controlPaddingY
           inputMethodHints: Qt.ImhDigitsOnly
@@ -781,6 +797,7 @@ Panel {
           id: commandField
           width: (parent.width - Style.space(12)) * 0.36
           foreground: root.foreground
+          maximumLength: 1024
           placeholderText: "on connect"
           verticalPadding: Style.spacing.controlPaddingY
           text: root.editCommand

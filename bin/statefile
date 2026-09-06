@@ -1,0 +1,269 @@
+#!/usr/bin/python3 -I
+
+"""Descriptor-bound read/write of the rules file.
+
+Every path in this plugin is predictable, which means any other process running
+as this user can plant a symlink, a FIFO or an oversized file on it between the
+moment a name is checked and the moment it is opened. A pathname test followed
+by a second open is a race, so nothing here re-resolves a name: the directory
+chain is walked with held descriptors from the passwd home, the file is opened
+once relative to that descriptor with O_NOFOLLOW|O_NONBLOCK, and the fstat that
+validates it and the read that consumes it use that same descriptor.
+
+Writes never truncate an existing name. A fresh, unpredictably named temporary
+is created in the destination directory at mode 0600 before the first byte,
+fsynced, and renamed into place -- rename(2) replaces a symlink at the
+destination instead of writing through it.
+
+Usage:
+  statefile read  <absolute-path>   bytes on stdout; exit 3 when absent
+  statefile write <absolute-path>   JSON document on stdin
+
+Exit codes:
+  0  success
+  1  refused (not a regular file, wrong owner, too large, bad JSON, ...)
+  2  usage error
+  3  file does not exist yet (normal before setup has run)
+"""
+
+import errno
+import json
+import os
+import pwd
+import secrets
+import stat
+import sys
+
+# The rules file is a hand-editable list of ssh rules. A megabyte is already far
+# more than any real tailnet needs; anything larger is not a config file.
+MAX_BYTES = 1 << 20
+MAX_DEPTH = 16
+
+
+def fail(message, code=1):
+    sys.stderr.write("statefile: %s\n" % message)
+    sys.exit(code)
+
+
+def home_dir():
+    """The passwd home, not $HOME: the environment is inherited and writable."""
+    return pwd.getpwuid(os.geteuid()).pw_dir
+
+
+def split_path(path):
+    """Split an absolute path into (anchor, directory components, filename).
+
+    Walking a chain with held descriptors needs a trusted anchor. The passwd
+    home is used when the path is under it, so the common case walks the fewest
+    components; anything else is walked from "/". Either way every component is
+    opened NOFOLLOW and checked, so the anchor only decides where the walk
+    starts, never how much is trusted.
+    """
+    if not path.startswith("/"):
+        fail("path must be absolute")
+    if "\0" in path:
+        fail("path may not contain a NUL byte")
+
+    home = home_dir().rstrip("/")
+    if home and path.startswith(home + "/"):
+        anchor, rest = home, path[len(home) + 1:]
+    else:
+        anchor, rest = "/", path[1:]
+
+    parts = [p for p in rest.split("/") if p != ""]
+    if not parts:
+        fail("path must name a file")
+    for part in parts:
+        if part in (".", ".."):
+            fail("path may not contain %r" % part)
+    return anchor, parts[:-1], parts[-1]
+
+
+def check_component(fd, name, final):
+    """Validate a directory this walk is about to stand on.
+
+    O_NOFOLLOW protects only the final component of an open, so every parent
+    gets the same treatment: opened NOFOLLOW relative to the descriptor above
+    it, then fstat-checked on that descriptor. A component owned by anyone but
+    root or this user is refused rather than repaired.
+    """
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise PermissionError("%r is not a directory" % name)
+    if st.st_uid not in (0, os.geteuid()):
+        raise PermissionError("directory %r is owned by uid %d" % (name, st.st_uid))
+    if not final:
+        return
+    # The directory the file actually lives in. What matters here is whether
+    # anyone else can create, rename or unlink entries in it -- read and execute
+    # bits do not expose a 0600 file, and `~/.local/state` being 0755 is normal.
+    # So the group and other WRITE bits are what is acted on, and the repair
+    # runs every time rather than only when the mode currently looks wrong: a
+    # directory that was ever writable may already hold a name someone else
+    # planted. It is deliberately not a blanket chmod to 0700 -- this directory
+    # may be $HOME or shared Omarchy state, and narrowing those would be a
+    # surprising side effect of saving a rules file.
+    writable_by_others = st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    if st.st_uid == os.geteuid():
+        if writable_by_others:
+            os.fchmod(fd, st.st_mode & ~(stat.S_IWGRP | stat.S_IWOTH) & 0o7777)
+    elif writable_by_others and not (st.st_mode & stat.S_ISVTX):
+        # Root-owned and writable by anyone, with no sticky bit: another account
+        # could rename our file out from under us. Refuse rather than repair --
+        # this is not a directory to be modifying.
+        raise PermissionError("directory %r is world-writable and not sticky" % name)
+
+
+def open_dir_chain(anchor, dirs, create):
+    fd = os.open(anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        check_component(fd, anchor, final=not dirs)
+        for index, name in enumerate(dirs):
+            try:
+                nfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                              dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(name, 0o700, dir_fd=fd)
+                nfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                              dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+            check_component(fd, name, final=index == len(dirs) - 1)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_bounded(dirfd, name):
+    """Open once, validate the descriptor, read from that same descriptor.
+
+    O_NONBLOCK matters as much as O_NOFOLLOW here: NOFOLLOW rejects a symlink,
+    but a FIFO planted on the name would block open() forever, before any type
+    check could run, and hang the caller.
+    """
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                     dir_fd=dirfd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENXIO):
+            fail("refusing %s: not a regular file" % name)
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            fail("refusing %s: not a regular file" % name)
+        if st.st_uid != os.geteuid():
+            fail("refusing %s: owned by uid %d" % (name, st.st_uid))
+        if st.st_nlink != 1:
+            fail("refusing %s: %d hard links" % (name, st.st_nlink))
+        if st.st_size > MAX_BYTES:
+            fail("refusing %s: %d bytes exceeds the %d byte limit" % (name, st.st_size, MAX_BYTES))
+        os.set_blocking(fd, True)
+        chunks = []
+        total = 0
+        while total <= MAX_BYTES:
+            chunk = os.read(fd, min(65536, MAX_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > MAX_BYTES:
+            fail("refusing %s: grew past the %d byte limit" % (name, MAX_BYTES))
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def write_atomic(dirfd, name, payload):
+    tmp = ".%s.%s.tmp" % (name, secrets.token_hex(8))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                 0o600, dir_fd=dirfd)
+    try:
+        # Set before the first byte rather than chmod'ing the name afterwards:
+        # the rules file carries usernames and hostnames from a private network.
+        os.fchmod(fd, 0o600)
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.rename(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        dsync = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=dirfd)
+        try:
+            os.fsync(dsync)
+        finally:
+            os.close(dsync)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dirfd)
+        except OSError:
+            pass
+        raise
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def check_depth(value, depth=0):
+    """A byte cap still admits one deeply nested document; recursion is bounded."""
+    if depth > MAX_DEPTH:
+        fail("document nests deeper than %d levels" % MAX_DEPTH)
+    if isinstance(value, dict):
+        for item in value.values():
+            check_depth(item, depth + 1)
+    elif isinstance(value, list):
+        for item in value:
+            check_depth(item, depth + 1)
+
+
+def main(argv):
+    if len(argv) != 3 or argv[1] not in ("read", "write"):
+        fail(__doc__.split("Usage:")[1].strip(), 2)
+    op, path = argv[1], argv[2]
+    anchor, dirs, name = split_path(path)
+
+    if op == "read":
+        try:
+            dirfd = open_dir_chain(anchor, dirs, create=False)
+        except FileNotFoundError:
+            sys.exit(3)
+        except (PermissionError, NotADirectoryError, OSError) as exc:
+            fail(str(exc))
+        try:
+            raw = read_bounded(dirfd, name)
+        finally:
+            os.close(dirfd)
+        if raw is None:
+            sys.exit(3)
+        sys.stdout.buffer.write(raw)
+        return
+
+    payload = sys.stdin.buffer.read(MAX_BYTES + 1)
+    if len(payload) > MAX_BYTES:
+        fail("payload exceeds the %d byte limit" % MAX_BYTES)
+    try:
+        parsed = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        fail("refusing to write invalid JSON: %s" % exc)
+    if not isinstance(parsed, dict):
+        fail("refusing to write a document that is not an object")
+    check_depth(parsed)
+
+    try:
+        dirfd = open_dir_chain(anchor, dirs, create=True)
+    except (PermissionError, NotADirectoryError, FileExistsError, OSError) as exc:
+        fail(str(exc))
+    try:
+        write_atomic(dirfd, name, payload)
+    finally:
+        os.close(dirfd)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

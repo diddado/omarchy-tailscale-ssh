@@ -39,8 +39,16 @@ You can re-run it any time:
 ~/.config/omarchy/plugins/io.github.diddado.tailscale-ssh/bin/setup
 ```
 
-Requires the `tailscale` CLI. `wl-copy` is needed for the copy actions and `gum`
-for the setup wizard; both ship with Omarchy.
+Requires the `tailscale` CLI, which the plugin looks for at `/usr/bin/tailscale`,
+`/usr/local/bin/tailscale` or `/opt/tailscale/tailscale` — absolute paths rather
+than `$PATH`, so another process cannot decide which binary answers. `wl-copy`
+(wl-clipboard) backs the copy actions and `gum` draws the setup wizard; both are
+in Omarchy's base package set. `python3` and `jq` are used by the helpers in
+`bin/` and ship with the system.
+
+The plugin only ever runs `tailscale status --json`. It never brings the tailnet
+up or down, and it needs no elevated privileges — nothing here uses `sudo` or
+`pkexec`.
 
 ## Using it
 
@@ -78,7 +86,9 @@ The rules file lives at:
 ~/.local/state/omarchy/settings/io.github.diddado.tailscale-ssh.json
 ```
 
-Edits apply immediately — no restart.
+Edits apply immediately — no restart. The file is created mode `0600`, in a
+directory created `0700`, and is never read or written through its name
+directly; see [Security](#security).
 
 ```json
 {
@@ -181,9 +191,9 @@ Since rules merge, one line gives it to a whole fleet:
 Other things worth putting there:
 
 ```json
-{ "tag": "role-db",  "command": "sudo -u postgres psql" }
-{ "host": "logs-01", "command": "journalctl -fu myapp" }
-{ "host": "docker-1","command": "sudo docker compose logs -f" }
+{ "tag": "role-db",  "command": "psql -U postgres" }
+{ "host": "logs-01", "command": "journalctl --user -fu myapp" }
+{ "host": "docker-1","command": "docker compose logs -f" }
 ```
 
 A machine with a `command` shows it in the panel with a `↦` marker, so you can
@@ -202,47 +212,130 @@ omarchy bar set io.github.diddado.tailscale-ssh connectVia ip
 | Key | Default | Purpose |
 |---|---|---|
 | `refreshIntervalSec` | `30` | How often `tailscale status` is polled |
-| `configPath` | *(state dir)* | Move the rules file elsewhere |
-| `defaultUser` | *(local user)* | Fallback when no rule matches |
+| `configPath` | *(state dir)* | Move the rules file elsewhere — an absolute path, or one starting `~/` |
 | `connectVia` | `dns` | `dns` \| `ip` \| `hostname` |
 | `showOffline` | `true` | List offline machines, dimmed |
 | `focusFilterOnOpen` | `true` | Type to filter the moment the panel opens |
 
 Numbers and booleans need `--json`, or they land in `shell.json` as strings.
 
+The fallback login user is not a widget setting: it is `defaultUser` in the rules
+file, and with that unset it is your local `$USER`.
+
 ## Removing
 
 ```bash
 omarchy plugin remove io.github.diddado.tailscale-ssh
-rm ~/.local/state/omarchy/settings/io.github.diddado.tailscale-ssh.json
 ```
 
-The second line matters: nothing removes plugin state automatically, and
-uninstalling does not delete your rules.
+That deletes the plugin directory and its entry in `~/.config/omarchy/shell.json`.
+It does **not** delete anything the plugin wrote outside its own directory, and
+nothing else does either. Everything that survives removal is listed here:
+
+| Path | What it holds | Removal |
+|---|---|---|
+| `~/.local/state/omarchy/settings/io.github.diddado.tailscale-ssh.json` | Your rules: hostnames, groups, login users, ports, connect commands | Kept |
+| `~/.local/state/omarchy/settings/io.github.diddado.tailscale-ssh.json.bak.<timestamp>` | One snapshot of the previous rules per `bin/setup` run | Kept |
+
+Both are mode `0600`. To delete them too:
+
+```bash
+rm -f ~/.local/state/omarchy/settings/io.github.diddado.tailscale-ssh.json \
+      ~/.local/state/omarchy/settings/io.github.diddado.tailscale-ssh.json.bak.*
+```
+
+There is nothing else to undo. The plugin installs no service, no timer, no
+hook, no sudoers rule and no polkit action; it starts no background process that
+outlives the shell; it never edits `~/.config/hypr` or any other component's
+files; and the terminals it opens are ordinary `ssh` sessions that end when you
+close them.
 
 ## Security
 
-The plugin only ever *reads* `tailscale status --json`. It never brings the
-tailnet up or down and needs no elevated privileges.
+A bar widget runs inside `omarchy-shell` — the one long-lived process that draws
+every other widget on the desktop — and almost nothing it handles is a value it
+chose. Hostnames, tags and DNS names come from whoever owns each machine on the
+tailnet. The rules file is a plain-text document any other process running as
+this user can rewrite. Both are treated accordingly.
 
-Hostnames, usernames, and `sshArgs` come from the network and from a config
-file, so nothing is ever interpolated into a shell string. Commands are built as
-argv vectors and run through `bash -lc 'exec "$@"'`, which leaves arguments in
-positional parameters where they cannot be re-tokenized.
+**No value ever becomes a command.** Every process is an argv vector; no shell
+string is built from data anywhere in the tree. The `ssh` destination goes after
+`--`, and it is validated besides: `ssh` parses argv with getopt, so a machine
+that names itself `-oProxyCommand=…` would otherwise turn its own hostname into
+a command on your desktop. A destination or login user that does not validate is
+**refused and reported**, never repaired — a silently corrected hostname would
+connect somewhere other than where you meant. The per-machine window id is held
+to `[A-Za-z0-9._-]` because `omarchy-launch-tui` expands it unquoted.
+
+**Nothing is read or written through a pathname.** `bin/statefile` is the one
+place the rules file is touched. It walks the directory chain from a trusted
+anchor with held descriptors, opens the file once with
+`O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`, and validates *that descriptor* — regular
+file, owned by you, one link, under the size ceiling — before reading a bounded
+number of bytes from it. Writes create an unpredictably named temporary in the
+destination directory at mode `0600` before the first byte, `fsync` it, and
+`rename` it into place; `rename(2)` replaces a symlink at the destination rather
+than writing through it. If the containing directory is writable by group or
+other, those bits are removed on every write — not only when the mode currently
+looks wrong, because a directory that was ever writable may already hold a name
+someone else planted. (Read and execute bits are left as you set them: they do
+not expose a `0600` file, and `~/.local/state` being `0755` is normal.)
+`FileView` is used as an inotify watcher only (`preload: false`,
+`blockAllReads: true`) and never opens the file.
+
+**Everything is bounded at the producer.** `bin/tailscale-status` runs the CLI in
+its own session under an absolute deadline with `TERM` → `KILL` escalation, and
+caps stdout at 1 MiB + 1 byte so an overflow is detected rather than truncated;
+stderr is capped separately. The panel counts bytes as chunks arrive and kills
+the producer on overflow — there is no `StdioCollector` anywhere. After the byte
+cap come the ones that matter just as much: peer count, tag count, address
+count, rule count, string length, `regex` pattern length, and recursion depth.
+Collections keyed by names from the network or the file use null-prototype maps.
+
+**Every string that reaches the screen names its format.** Qt renders a string
+that looks like markup as rich text, and rich text loads `<img src="…">` — a real
+request out of the shell process to a URL the string's author picked. Every
+`Text` in this plugin sets `textFormat: Text.PlainText`, literal ones included,
+so the invariant is greppable. The shell's own components (`PanelHero`,
+`PanelSectionHeader`, tooltips) cannot be pinned from a plugin, so anything
+variable reaching one has `<`, `>`, `&`, control characters and bidi overrides
+stripped and its length capped first.
+
+**Executables are absolute.** `$PATH` is inherited from the shell process and
+another process running as this user can prepend to it, so every helper is
+invoked by absolute path and every helper process runs with `clearEnvironment`
+and a minimal environment — no `BASH_ENV`, no `PYTHONPATH`, no `LD_PRELOAD`.
+
+**No privilege, no network, no supply chain.** The plugin runs one command,
+`tailscale status --json`, and never mutates Tailscale state. It makes no HTTP
+request of its own. It installs nothing, downloads nothing, builds nothing and
+updates nothing; the reviewed commit is the code that runs. Loading the widget
+is read-only — even the state directory is created on your first save, not at
+mount. There are no bundled binaries and no agent instruction files in the tree.
+
+`test/statefile.test.sh` mounts the actual attacks (planted symlink, planted
+FIFO, hard link, oversized file, widened directory, symlinked parent) and
+asserts each is refused; `test/audit.test.sh` re-checks the greppable invariants
+above so a later edit cannot quietly drop one.
 
 ## Development
 
 ```bash
 ./scripts/dev-install.sh          # symlink this checkout into Omarchy
-node test/model.test.js           # rule engine
+node test/model.test.js           # rule engine, argv construction, bounds
 bash test/setup.test.sh           # config generator, against fixture tailnets
+bash test/statefile.test.sh       # file-handling races, against real attacks
+bash test/audit.test.sh           # static invariants across the tree
 omarchy plugin validate .         # manifest schema
 omarchy restart shell             # reload after a QML edit
 ```
 
-`Model.js` holds the pure logic and carries the tests; `bin/setup` holds the
-generator and depends only on bash and `jq`. `Service.qml` owns subprocesses and
-config I/O, `Panel.qml` is presentation and the keyboard cursor model.
+`Model.js` holds the pure logic and carries the tests. `Service.qml` owns
+subprocesses and config I/O; `Panel.qml` is presentation and the keyboard cursor
+model. `bin/setup` generates rules and depends only on bash and `jq`;
+`bin/statefile` and `bin/tailscale-status` are the two I/O boundaries, and both
+`Service.qml` and `bin/setup` go through them rather than reimplementing the
+checks — one implementation means one place to get it right.
 
 A note that will save you time: editing a bar widget's QML needs
 `omarchy restart shell`. The inotify watcher fires and

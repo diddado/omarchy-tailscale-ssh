@@ -1,0 +1,52 @@
+#!/usr/bin/bash
+
+# omarchy:summary=Read `tailscale status --json` with a byte ceiling and a deadline
+# omarchy:args=
+
+# The shell process that hosts this widget also hosts every other widget on the
+# desktop, so it must never take an unbounded read from a subprocess. This
+# wrapper is the only thing the panel runs: it caps stdout at MAX_BYTES + 1 at
+# the producer (so an overflow is detected rather than silently truncated),
+# bounds stderr separately, runs the CLI in its own session under an absolute
+# deadline, and escalates TERM to KILL for the whole group.
+#
+# Exit codes are the contract with Service.qml:
+#   0    JSON on stdout, at most MAX_BYTES
+#   127  the tailscale CLI is not installed
+#   1    output exceeded the ceiling
+#   *    whatever tailscale exited with (daemon down, not logged in, ...)
+
+set -uo pipefail
+
+MAX_BYTES=1048576
+DEADLINE=10
+
+# Resolved from a fixed list of absolute paths rather than $PATH: PATH is
+# inherited from the shell process and another process running as this user can
+# prepend to it. Covers the Arch package and the upstream static tarball.
+TAILSCALE=""
+for candidate in /usr/bin/tailscale /usr/local/bin/tailscale /opt/tailscale/tailscale; do
+  if [[ -x $candidate && ! -L $candidate ]]; then
+    TAILSCALE="$candidate"
+    break
+  fi
+done
+[[ -n $TAILSCALE ]] || { echo "tailscale CLI not found" >&2; exit 127; }
+
+out=$(
+  /usr/bin/setsid -w /usr/bin/timeout -k 2 "$DEADLINE" \
+    "$TAILSCALE" status --json 2> >(/usr/bin/head -c 2048 >&2) \
+    | /usr/bin/head -c $((MAX_BYTES + 1))
+)
+rc=$?
+
+# head read MAX_BYTES + 1, so anything longer than the ceiling is an overflow
+# rather than a value we quietly cut in half. Checked before the exit status so
+# a huge-but-successful response still fails closed.
+if (( ${#out} > MAX_BYTES )); then
+  echo "tailscale status exceeded ${MAX_BYTES} bytes" >&2
+  exit 1
+fi
+
+(( rc == 0 )) || exit "$rc"
+printf '%s' "$out"

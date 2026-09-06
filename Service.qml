@@ -54,15 +54,55 @@ Item {
   // settings stored inline in shell.json.
   readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/omarchy/settings"
   readonly property string defaultConfigPath: stateDir + "/io.github.diddado.tailscale-ssh.json"
-  readonly property string configPath: {
-    var override = String(setting("configPath", "")).trim()
-    return override === "" ? defaultConfigPath : expandHome(override)
+  // A configPath from shell.json is validated here rather than where it is
+  // used. It has to be absolute -- bin/statefile refuses anything else, and a
+  // value beginning with "-" would read as an option to the editor the pencil
+  // button launches. An unusable override falls back to the default rather than
+  // leaving the panel with no config at all.
+  readonly property string configPathOverride: {
+    var override = expandHome(String(setting("configPath", "")).trim())
+    if (override === "" || override.charAt(0) !== "/") return ""
+    if (/[\u0000-\u001f]/.test(override)) return ""
+    return override
+  }
+  readonly property string configPath: configPathOverride === "" ? defaultConfigPath : configPathOverride
+  readonly property bool configPathRejected: {
+    var raw = String(setting("configPath", "")).trim()
+    return raw !== "" && configPathOverride === ""
   }
 
   // The plugin's own directory, so the panel can launch bin/setup. The bar
   // injects only bar/moduleName/settings, never a source dir, so resolve it
   // from this file's own URL.
   readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, "")
+
+  // Absolute interpreters, never a bare name. PATH is inherited from the shell
+  // process and any other process running as this user can prepend to it, so a
+  // bare `bash` or `python3` is a name someone else may get to resolve.
+  readonly property string bashPath: "/usr/bin/bash"
+  readonly property string pythonPath: "/usr/bin/python3"
+  readonly property string statefileHelper: pluginDir + "/bin/statefile"
+  readonly property string statusHelper: pluginDir + "/bin/tailscale-status"
+
+  // The minimum a helper needs. clearEnvironment plus this drops BASH_ENV,
+  // PYTHONPATH, LD_PRELOAD and everything else that rides in on an inherited
+  // environment.
+  readonly property var helperEnv: ({
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "HOME": Quickshell.env("HOME") || "",
+    "XDG_RUNTIME_DIR": Quickshell.env("XDG_RUNTIME_DIR") || "",
+    "LC_ALL": "C"
+  })
+
+  // Matches MAX_BYTES in bin/statefile and in bin/tailscale-status. Both cap at
+  // the producer; this is the shell-side backstop that makes an overflow
+  // visible rather than merely large.
+  readonly property int maxHelperBytes: 1048576
+
+  // Sanitizer for the shell's own components -- PanelHero, PanelSectionHeader,
+  // a tooltip -- which render with Text.AutoText and cannot be pinned to
+  // PlainText from a plugin.
+  function plain(value, max) { return Model.plain(value, max) }
 
   // Setup has run when the config parsed and actually carries something.
   property bool configLoaded: false
@@ -170,16 +210,64 @@ Item {
   // exists precisely for this.
   function connect(entry) {
     if (!entry) return
+    // A machine names itself, so its hostname is not a value this plugin chose.
+    // Model refuses one that would read to ssh as an option instead of a host,
+    // and that refusal is reported rather than quietly worked around: a
+    // repaired hostname would connect somewhere other than where you meant.
+    if (entry.target.problem) {
+      flash("Cannot connect: " + plain(entry.target.problem, 160))
+      return
+    }
     var argv = Model.sshArgv(entry.peer, entry.target, "org.omarchy.tailssh")
+    if (argv.length === 0) {
+      flash("Cannot connect: " + plain(entry.target.label, 64) + " has no usable ssh target")
+      return
+    }
     Util.execArgv(argv)
-    flash("Connecting to " + entry.target.label + "…")
+    flash("Connecting to " + plain(entry.target.label, 64) + "…")
   }
 
+  // The value reaches wl-copy on stdin, as an argv array with no shell in the
+  // middle. The previous form built a `bash -c "printf %s '...' | wl-copy"`
+  // string; the quoting made it correct, but a command assembled as text is one
+  // editing mistake away from being re-tokenized, and there is no reason to
+  // construct one at all.
+  property string _clipboardPending: ""
+  property string _clipboardLabel: ""
+
   function copyToClipboard(value, label) {
-    var text = String(value || "")
+    var text = Model.clamp(value, 4096)
     if (text === "") return
-    Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(text) + " | wl-copy"])
-    flash("Copied " + label)
+    if (clipboardProc.running) clipboardProc.signal(15)
+    _clipboardPending = text
+    _clipboardLabel = String(label || "")
+    clipboardProc.command = ["/usr/bin/wl-copy"]
+    clipboardProc.running = true
+  }
+
+  Process {
+    id: clipboardProc
+    running: false
+    command: []
+    stdinEnabled: true
+    clearEnvironment: true
+    environment: ({
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "XDG_RUNTIME_DIR": Quickshell.env("XDG_RUNTIME_DIR") || "",
+      "WAYLAND_DISPLAY": Quickshell.env("WAYLAND_DISPLAY") || ""
+    })
+    onStarted: {
+      write(root._clipboardPending)
+      stdinEnabled = false
+      root._clipboardPending = ""
+    }
+    // Reported after the fact, not before it: saying "Copied" when wl-clipboard
+    // is not installed would be the panel making a claim it cannot support.
+    onExited: function (exitCode) {
+      if (exitCode === 0) root.flash("Copied " + root._clipboardLabel)
+      else root.flash("Could not copy — is wl-clipboard installed?")
+      root._clipboardLabel = ""
+    }
   }
 
   function copySshCommand(entry) {
@@ -213,19 +301,20 @@ Item {
 
   // ---------------------------------------------------------------- config file
 
-  // watchChanges picks up edits made by bin/setup or by $EDITOR while the panel
-  // is open. applyConfig compares before assigning, so this plugin's own writes
-  // coming back through the watcher settle instead of looping.
+  // FileView is a WATCHER here and nothing else: preload off and blockAllReads
+  // on, so binding the path never opens the file. FileView follows symlinks,
+  // reads the whole file with no ceiling, and would block on a FIFO planted at
+  // a predictable path -- inside the process that draws every other widget on
+  // the desktop. Every actual read goes through bin/statefile instead, which
+  // opens once with O_NOFOLLOW|O_NONBLOCK, validates the descriptor it holds,
+  // and reads a bounded number of bytes from that same descriptor.
   FileView {
-    id: configFile
+    id: configWatcher
     path: root.configPath
+    preload: false
+    blockAllReads: true
     watchChanges: true
-    atomicWrites: true
     printErrors: false
-    onLoaded: root.applyConfig(true, text())
-    // A failed read is usually a rename-style save in flight, not a missing
-    // config. The reducer decides which.
-    onLoadFailed: root.applyConfig(false, "")
     // An editor save emits several inotify events; reading on each one meant
     // parsing the file mid-write. Settle first, then read once.
     onFileChanged: configDebounce.restart()
@@ -235,7 +324,7 @@ Item {
     id: configDebounce
     interval: 150
     repeat: false
-    onTriggered: configFile.reload()
+    onTriggered: root.reloadConfig()
   }
 
   // Armed when the reducer wants a second look: content that failed to parse is
@@ -244,7 +333,159 @@ Item {
     id: configRetry
     interval: 400
     repeat: false
-    onTriggered: configFile.reload()
+    onTriggered: root.reloadConfig()
+  }
+
+  // ---- reading: bin/statefile read <path>
+  //
+  // Chunks are counted as they arrive and the producer is killed on overflow,
+  // rather than collected whole and measured afterwards. StdioCollector would
+  // hold the entire stream first, which puts the decision after the allocation
+  // it is supposed to prevent.
+  property string _readBuf: ""
+  property int _readBytes: 0
+  property bool _readOverflow: false
+  property string _readErr: ""
+
+  Process {
+    id: readProc
+    running: false
+    command: []
+    clearEnvironment: true
+    environment: root.helperEnv
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function (chunk) {
+        if (root._readOverflow) return
+        root._readBytes += chunk.length
+        if (root._readBytes > root.maxHelperBytes) {
+          root._readOverflow = true
+          root._readBuf = ""
+          readProc.signal(15)
+          readKill.restart()
+          return
+        }
+        root._readBuf += chunk
+      }
+    }
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function (chunk) { root._readErr = Model.clamp(root._readErr + Model.clamp(chunk, 400), 400) }
+    }
+    onExited: function (exitCode) {
+      readKill.stop()
+      readDeadline.stop()
+      var text = root._readBuf
+      var overflow = root._readOverflow
+      var err = root._readErr.replace(/^statefile:\s*/, "").trim()
+      root._readBuf = ""
+      root._readBytes = 0
+      root._readOverflow = false
+      root._readErr = ""
+
+      if (overflow) {
+        root.rulesError = "rules file is larger than " + root.maxHelperBytes + " bytes"
+        root.configLoaded = true
+        if (root._reloadPending) root.reloadConfig()
+        return
+      }
+      // 3 is "not there yet", the normal state before setup has run. 1 means
+      // the helper refused the file -- not a regular file, wrong owner, too
+      // large. That is worth showing, not worth retrying into.
+      if (exitCode === 1) {
+        root.rulesError = Model.plain(err, 200) || "rules file was refused"
+        root.configLoaded = true
+        if (root._reloadPending) root.reloadConfig()
+        return
+      }
+      // 3 means the file is not there yet; 0 means it is, and from then on the
+      // inotify watcher is enough.
+      if (exitCode === 0) root.configFileSeen = true
+      root.applyConfig(exitCode === 0, exitCode === 0 ? text : "")
+      if (root._reloadPending) root.reloadConfig()
+    }
+  }
+
+  Timer {
+    id: readDeadline
+    interval: 5000
+    repeat: false
+    onTriggered: if (readProc.running) { readProc.signal(15); readKill.restart() }
+  }
+
+  Timer {
+    id: readKill
+    interval: 2000
+    repeat: false
+    onTriggered: if (readProc.running) readProc.signal(9)
+  }
+
+  // ---- writing: bin/statefile write <path>, document on stdin
+  //
+  // The helper creates an unpredictably named temporary in the destination
+  // directory at mode 0600 before the first byte, fsyncs it and renames it into
+  // place. rename(2) replaces a symlink at the destination instead of writing
+  // through it, which a plain `>` or FileView.setText does not.
+  property string _writePending: ""
+  property string _writeQueued: ""
+  property string _writeErr: ""
+
+  Process {
+    id: writeProc
+    running: false
+    command: []
+    stdinEnabled: true
+    clearEnvironment: true
+    environment: root.helperEnv
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function (chunk) { root._writeErr = Model.clamp(root._writeErr + Model.clamp(chunk, 400), 400) }
+    }
+    onStarted: {
+      write(root._writePending)
+      stdinEnabled = false
+      root._writePending = ""
+    }
+    onExited: function (exitCode) {
+      writeKill.stop()
+      writeDeadline.stop()
+      if (exitCode !== 0) {
+        var err = root._writeErr.replace(/^statefile:\s*/, "").trim()
+        root.rulesError = Model.plain(err, 200) || "could not write the rules file"
+        root.flash("Save failed")
+      }
+      root._writeErr = ""
+      // Single-flight: a save made while one was in flight runs now, so two
+      // fast edits cannot interleave two writers on the same file.
+      if (root._writeQueued !== "") {
+        var queued = root._writeQueued
+        root._writeQueued = ""
+        root.startWrite(queued)
+      }
+    }
+  }
+
+  Timer {
+    id: writeDeadline
+    interval: 5000
+    repeat: false
+    onTriggered: if (writeProc.running) { writeProc.signal(15); writeKill.restart() }
+  }
+
+  Timer {
+    id: writeKill
+    interval: 2000
+    repeat: false
+    onTriggered: if (writeProc.running) writeProc.signal(9)
+  }
+
+  function startWrite(text) {
+    if (writeProc.running) { _writeQueued = text; return }
+    _writePending = text
+    _writeErr = ""
+    writeProc.command = [pythonPath, "-I", statefileHelper, "write", configPath]
+    writeProc.running = true
+    writeDeadline.restart()
   }
 
   property string _lastConfigText: ""
@@ -268,22 +509,47 @@ Item {
     if (next.retry) configRetry.restart()
   }
 
+  // Single-flight, but never a dropped change: a reload asked for while one is
+  // in flight is remembered and run when that one lands. Returning early
+  // instead would silently lose the edit the watcher had just seen.
+  property bool _reloadPending: false
+
   function reloadConfig() {
-    configFile.reload()
+    if (readProc.running) { _reloadPending = true; return }
+    _reloadPending = false
+    _readBuf = ""
+    _readBytes = 0
+    _readOverflow = false
+    _readErr = ""
+    readProc.command = [pythonPath, "-I", statefileHelper, "read", configPath]
+    readProc.running = true
+    readDeadline.restart()
   }
 
-  // FileView will not create parent directories, so mkdir has to land first and
-  // the initial read is deferred a tick behind it.
-  Process {
-    id: ensureDirProc
-    command: []
-    running: false
+  // Loading the plugin reads; it does not create anything. The state directory
+  // is created by bin/statefile on the first save, which is a deliberate user
+  // action -- mounting a widget is not.
+  Component.onCompleted: Qt.callLater(function () { root.reloadConfig() })
+
+  // FileView cannot watch a file that does not exist yet, so until one does the
+  // poll tick re-reads. The moment a read succeeds the watcher takes over and
+  // this stands down for good -- it is a cold-start bridge, not a poll loop.
+  property bool configFileSeen: false
+
+  Timer {
+    id: configColdStart
+    interval: Math.max(5, root.refreshIntervalSec) * 1000
+    repeat: true
+    running: !root.configFileSeen
+    onTriggered: root.reloadConfig()
   }
 
-  Component.onCompleted: {
-    ensureDirProc.command = ["mkdir", "-p", root.stateDir]
-    ensureDirProc.running = true
-    Qt.callLater(function () { configFile.reload() })
+  Component.onDestruction: {
+    // Nothing this plugin started outlives it.
+    if (readProc.running) readProc.signal(15)
+    if (writeProc.running) writeProc.signal(15)
+    if (statusProcess.running) statusProcess.signal(15)
+    if (clipboardProc.running) clipboardProc.signal(15)
   }
 
   function saveRules(nextRules) {
@@ -297,7 +563,7 @@ Item {
     _pendingBadText = ""
     rulesError = ""
     configDoc = nextDoc
-    configFile.setText(text)
+    startWrite(text)
     flash("Saved")
   }
 
@@ -344,9 +610,16 @@ Item {
   function refresh() {
     if (statusProcess.running) return
     refreshing = true
-    statusProcess.command = ["tailscale", "status", "--json"]
+    _statusBuf = ""
+    _statusBytes = 0
+    _statusOverflow = false
+    _statusErr = ""
+    // bin/tailscale-status, not the CLI directly: the helper runs it in its own
+    // session under an absolute deadline, caps stdout at the producer and
+    // bounds stderr separately.
+    statusProcess.command = [bashPath, statusHelper]
     statusProcess.running = true
-    if (!pollWatchdog.running) pollWatchdog.start()
+    pollWatchdog.restart()
   }
 
   function applyStatus(text) {
@@ -364,8 +637,8 @@ Item {
     peers = parsed.peers
     lastError = ""
     statusText = parsed.running
-      ? (peers.length + " machines · " + onlineCount + " online")
-      : (parsed.needsLogin ? "Not logged in" : parsed.backendState)
+      ? (peers.length + (parsed.truncated ? "+" : "") + " machines · " + onlineCount + " online")
+      : (parsed.needsLogin ? "Not logged in" : Model.plain(parsed.backendState, 64))
   }
 
   function resetUnavailable(text) {
@@ -374,25 +647,69 @@ Item {
     statusText = String(text || "Unavailable")
   }
 
+  // Chunk-counted rather than collected. A StdioCollector holds the whole of
+  // stdout and stderr before any length check can run, so the guard would sit
+  // after the allocation it exists to prevent -- inside the process that hosts
+  // every other widget on the desktop.
+  property string _statusBuf: ""
+  property int _statusBytes: 0
+  property bool _statusOverflow: false
+  property string _statusErr: ""
+
   Process {
     id: statusProcess
     running: false
     command: []
-    stdout: StdioCollector { id: statusStdout; waitForEnd: true }
-    stderr: StdioCollector { id: statusStderr; waitForEnd: true }
+    clearEnvironment: true
+    environment: root.helperEnv
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function (chunk) {
+        if (root._statusOverflow) return
+        root._statusBytes += chunk.length
+        if (root._statusBytes > root.maxHelperBytes) {
+          root._statusOverflow = true
+          root._statusBuf = ""
+          statusProcess.signal(15)
+          statusKill.restart()
+          return
+        }
+        root._statusBuf += chunk
+      }
+    }
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function (chunk) { root._statusErr = Model.clamp(root._statusErr + Model.clamp(chunk, 400), 400) }
+    }
     onExited: function (exitCode) {
+      pollWatchdog.stop()
+      statusKill.stop()
       root.refreshing = false
+
+      var text = root._statusBuf
+      var overflow = root._statusOverflow
+      var err = Model.plain(root._statusErr.trim(), 200)
+      root._statusBuf = ""
+      root._statusBytes = 0
+      root._statusOverflow = false
+      root._statusErr = ""
+
+      if (overflow) {
+        root.resetUnavailable("Status response too large")
+        root.lastError = "tailscale status exceeded " + root.maxHelperBytes + " bytes"
+        return
+      }
       if (exitCode === 0) {
         root.installed = true
-        root.applyStatus(String(statusStdout.text || ""))
-      } else {
-        var err = String(statusStderr.text || "").trim()
-        // Exit 127 is "command not found" from the shell layer; anything else
-        // means tailscaled is not answering yet.
-        root.installed = exitCode !== 127
-        root.resetUnavailable(root.installed ? "Disconnected" : "Tailscale not installed")
-        root.lastError = err
+        root.applyStatus(text)
+        return
       }
+      // 127 is the helper saying it could not find the CLI at any of the
+      // absolute paths it will accept; anything else means tailscaled is not
+      // answering yet.
+      root.installed = exitCode !== 127
+      root.resetUnavailable(root.installed ? "Disconnected" : "Tailscale not installed")
+      root.lastError = err
     }
   }
 
@@ -421,10 +738,21 @@ Item {
   }
 
   // A wedged `tailscale status` must not leave the panel spinning forever.
+  // `running = false` reaches only the wrapper, so the escalation is explicit:
+  // TERM, a short grace, then KILL. The helper puts the CLI in its own session
+  // under `timeout -k`, so the signal reaches the whole group rather than just
+  // the process this one holds a handle to.
   Timer {
     id: pollWatchdog
     interval: 15000
     repeat: false
-    onTriggered: if (statusProcess.running) statusProcess.running = false
+    onTriggered: if (statusProcess.running) { statusProcess.signal(15); statusKill.restart() }
+  }
+
+  Timer {
+    id: statusKill
+    interval: 2000
+    repeat: false
+    onTriggered: if (statusProcess.running) statusProcess.signal(9)
   }
 }

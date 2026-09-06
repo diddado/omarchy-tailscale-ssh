@@ -89,6 +89,10 @@ Item {
 
     Text {
       anchors.centerIn: parent
+      // Literal, but pinned anyway: the invariant a reviewer can check is
+      // "every Text in this tree names its format", not "every Text that
+      // happens to hold a variable does".
+      textFormat: Text.PlainText
       text: "!"
       color: Color.background
       font.family: Style.font.family
