@@ -531,6 +531,96 @@ function serializeConfig(config) {
   }, null, 2) + "\n"
 }
 
+// The caption under a row. The row title is already the hostname, so repeating
+// "user@hostname.tailnet.ts.net" spends the whole line on something the reader
+// can see directly above — and elision then hides the facts that are actually
+// exceptional (a tag, a non-standard port, a command that runs on connect).
+// The address is shown only when it is NOT simply the machine's own DNS name,
+// i.e. when connectVia or an `address` override has changed it.
+function rowDetail(peer, target) {
+  var parts = []
+  var user = String(target.user || "")
+  var address = String(target.address || "")
+  var dnsName = String(peer.DNSName || "")
+
+  if (address !== "" && address !== dnsName) parts.push(user === "" ? address : user + "@" + address)
+  else if (user !== "") parts.push(user)
+
+  var tags = peer.Tags || []
+  if (tags.length > 0) parts.push(String(tags[0]))
+  if (target.port > 0) parts.push("port " + target.port)
+  if (target.command) parts.push("\u21a6 " + String(target.command))
+  return parts.join(" \u00b7 ")
+}
+
+// ---------------------------------------------------- config load reducer
+
+// Deciding what to do with a config read is genuinely stateful, and getting it
+// wrong is how a stale parse error ends up latched on screen. It lives here,
+// pure and testable, rather than in QML.
+//
+// The load-bearing idea: an editor save is not one atomic event. A file being
+// rewritten and a file that is genuinely broken look *identical* at the instant
+// you read one. The only way to tell them apart is to look again. So a failed
+// parse is provisional — it becomes an error only if the same bytes are still
+// invalid on a second read.
+//
+// prev:     { lastText, error, config, loaded, pendingBadText }
+// incoming: { loaded: bool, text: string }   loaded:false means the read failed
+// returns prev's shape plus `retry`, asking the caller to re-read shortly.
+function nextConfigState(prev, incoming) {
+  var state = {
+    lastText: (prev && prev.lastText) || "",
+    error: (prev && prev.error) || "",
+    config: (prev && prev.config) || parseRules(""),
+    loaded: !!(prev && prev.loaded),
+    pendingBadText: (prev && prev.pendingBadText) || "",
+    retry: false
+  }
+
+  var readOk = !incoming || incoming.loaded !== false
+  var raw = String((incoming && incoming.text) || "")
+
+  // A failed read, or a file that is momentarily empty, is almost always a
+  // rename-style save in progress — not a user who deleted their rules. Hold
+  // what we have and look again. Without this, a save briefly wipes the list.
+  if (!readOk || raw.trim() === "") {
+    state.loaded = true
+    // Nothing to preserve on first run: an absent config is the normal
+    // pre-setup state, not something to retry over.
+    state.retry = state.lastText !== ""
+    return state
+  }
+
+  // The same bytes we already adopted. Any error still showing came from a read
+  // of a half-written file, so it demonstrably does not describe the current
+  // content — clear it. Skipping this is what latched the error.
+  if (raw === state.lastText) {
+    state.error = ""
+    state.pendingBadText = ""
+    state.loaded = true
+    return state
+  }
+
+  var parsed = parseRules(raw)
+  if (parsed.ok) {
+    state.config = parsed
+    state.lastText = raw
+    state.error = ""
+    state.pendingBadText = ""
+    state.loaded = true
+    return state
+  }
+
+  // Invalid. Keep the previous rules either way — a broken file should never
+  // cost you the config that was working a moment ago.
+  state.loaded = true
+  state.retry = state.pendingBadText !== raw
+  if (!state.retry) state.error = parsed.error   // still invalid on a second look
+  state.pendingBadText = raw
+  return state
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     filterIPv4: filterIPv4,
@@ -556,6 +646,8 @@ if (typeof module !== "undefined") {
     upsertRule: upsertRule,
     ruleFieldsFor: ruleFieldsFor,
     serializeConfig: serializeConfig,
-    CONFIG_HELP: CONFIG_HELP
+    CONFIG_HELP: CONFIG_HELP,
+    nextConfigState: nextConfigState,
+    rowDetail: rowDetail
   }
 }

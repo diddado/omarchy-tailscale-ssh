@@ -134,7 +134,7 @@ Panel {
     cursorIndex = 0
     cursorActive = false
     if (panelFlick) panelFlick.contentY = 0
-    tailssh.refresh()
+    tailssh.refreshAll()
     Qt.callLater(function () {
       if (root.focusFilterOnOpen && filterField) filterField.forceActiveFocus()
       else if (keyCatcher) keyCatcher.forceActiveFocus()
@@ -189,7 +189,7 @@ Panel {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
-    function refresh(): string { tailssh.refresh(); return "ok" }
+    function refresh(): string { tailssh.refreshAll(); return "ok" }
     function status(): string { return tailssh.statusText }
   }
 
@@ -249,7 +249,7 @@ Panel {
         else if (key === "y") tailssh.copySshCommand(root.selectedEntry())
         else if (key === "c") tailssh.copyIp(root.selectedEntry())
         else if (key === "d") tailssh.copyDnsName(root.selectedEntry())
-        else if (key === "r") tailssh.refresh()
+        else if (key === "r") tailssh.refreshAll()
       }
 
       Flickable {
@@ -313,7 +313,7 @@ Panel {
                   tooltipText: "Refresh"
                   foreground: root.foreground
                   fontFamily: root.fontFamily
-                  onClicked: tailssh.refresh()
+                  onClicked: tailssh.refreshAll()
                 }
               }
             }
@@ -326,7 +326,8 @@ Panel {
             width: parent.width
             textFormat: Text.PlainText
             text: {
-              if (tailssh.rulesError !== "") return "Rules file error: " + tailssh.rulesError
+              if (tailssh.rulesError !== "") return "Rules file is not valid JSON \u2014 "
+                  + tailssh.rulesError + ". Previous rules are still in use; click the pencil to fix it."
               if (tailssh.actionStatus !== "") return tailssh.actionStatus
               if (tailssh.lastError !== "") return tailssh.lastError
               return ""
@@ -378,7 +379,7 @@ Panel {
                 else if (event.key === Qt.Key_Y) { tailssh.copySshCommand(root.selectedEntry()); event.accepted = true }
                 else if (event.key === Qt.Key_C) { tailssh.copyIp(root.selectedEntry()); event.accepted = true }
                 else if (event.key === Qt.Key_D) { tailssh.copyDnsName(root.selectedEntry()); event.accepted = true }
-                else if (event.key === Qt.Key_R) { tailssh.refresh(); event.accepted = true }
+                else if (event.key === Qt.Key_R) { tailssh.refreshAll(); event.accepted = true }
               }
             }
           }
@@ -567,15 +568,8 @@ Panel {
       var address = String(entry.target.address || "")
       return user === "" ? address : user + "@" + address
     }
-    readonly property string detail: {
-      if (!entry) return ""
-      var parts = [account]
-      var tags = entry.peer.Tags || []
-      if (tags.length > 0) parts.push(String(tags[0]))
-      if (entry.target.port > 0) parts.push("port " + entry.target.port)
-      if (entry.target.command) parts.push("↦ " + entry.target.command)
-      return parts.join(" · ")
-    }
+    readonly property string detail:
+      entry ? tailssh.rowDetail(entry.peer, entry.target) : ""
 
     hasCursor: root.cursorActive && root.cursorIndex === rowIndex
     foreground: root.foreground

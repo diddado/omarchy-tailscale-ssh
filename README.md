@@ -52,7 +52,7 @@ for the setup wizard; both ship with Omarchy.
 | Terminal button | SSH into that machine |
 | Gear button, or `Alt+E` | Configure the login user for that machine |
 | `Alt+Y` / `Alt+C` | Copy the `ssh …` command / the Tailscale IP |
-| `Alt+R` | Refresh |
+| `Alt+R` | Reload the machine list and the rules file |
 | `Esc` | Clear the filter, then close |
 
 Connections open in your default terminal with a per-machine window id

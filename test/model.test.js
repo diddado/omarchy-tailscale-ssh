@@ -257,5 +257,86 @@ eq(withHelp._readme.some(function (l) { return /github\.com/.test(l) }), true,
 eq(Model.parseRules(Model.serializeConfig({ defaultUser: "me", rules: [{ host: "a" }] })).rules,
    [{ host: "a" }], "the reference block does not leak into the parsed rules")
 
+// ---------------------------------------------------------------------------
+// Config load reducer. These are the regression tests for a stale "JSON.parse:
+// Parse error" that stayed on screen after an editor save, while the rules it
+// complained about were loaded and working. An editor save fires several
+// inotify events; each triggered a read, and reads that landed mid-write were
+// treated as authoritative.
+
+function fresh() {
+  return { lastText: "", error: "", config: Model.parseRules(""), loaded: false, pendingBadText: "" }
+}
+function feed(state, text, readOk) {
+  return Model.nextConfigState(state, { loaded: readOk !== false, text: text })
+}
+
+var CFG_A = Model.serializeConfig({ defaultUser: "me", rules: [{ prefix: "app-" }] })
+var CFG_B = Model.serializeConfig({ defaultUser: "me", rules: [{ prefix: "app-", user: "ubuntu" }] })
+var TRUNCATED = CFG_B.slice(0, 200)
+
+section("config reducer: a save is read cleanly")
+var st = feed(fresh(), CFG_A)
+eq(st.error, "", "a valid file loads without error")
+eq(st.config.rules.length, 1, "and its rules are adopted")
+
+section("config reducer: partial read, then the final good read")
+st = feed(feed(feed(fresh(), CFG_A), TRUNCATED), CFG_B)
+eq(st.error, "", "no error survives")
+eq(st.config.rules[0].user, "ubuntu", "the edit is adopted")
+
+section("config reducer: reloads complete out of order, partial lands last")
+st = feed(feed(feed(fresh(), CFG_A), CFG_B), TRUNCATED)
+eq(st.error, "", "a late partial read does not raise an error")
+eq(st.config.rules[0].user, "ubuntu", "and does not disturb the adopted rules")
+
+section("config reducer: save reproduces the previous bytes")
+st = feed(feed(feed(fresh(), CFG_A), TRUNCATED), CFG_A)
+eq(st.error, "", "re-reading the already-adopted bytes clears a stale error")
+eq(st.config.rules.length, 1, "rules intact")
+
+section("config reducer: file briefly absent during a rename-style save")
+st = feed(feed(fresh(), CFG_A), "", false)
+eq(st.config.rules.length, 1, "a failed read never drops the loaded rules")
+eq(st.error, "", "and is not reported as an error")
+eq(st.retry, true, "it asks to look again")
+eq(feed(fresh(), "", false).retry, false,
+   "but an absent config on first run is the normal pre-setup state, not a retry")
+
+section("config reducer: a genuinely broken file")
+st = feed(feed(fresh(), CFG_A), TRUNCATED)
+eq(st.error, "", "one bad read is provisional, not an error")
+eq(st.retry, true, "it asks for a second look")
+eq(st.config.rules.length, 1, "the working rules stay loaded meanwhile")
+var confirmed = feed(st, TRUNCATED)
+eq(confirmed.error !== "", true, "the same bad bytes twice is a real error")
+eq(confirmed.retry, false, "and stops retrying")
+eq(confirmed.config.rules.length, 1, "even then the last good rules are kept")
+
+section("config reducer: recovering from a broken file")
+eq(feed(confirmed, CFG_B).error, "", "fixing the file clears the error")
+eq(feed(confirmed, CFG_B).config.rules[0].user, "ubuntu", "and adopts the fix")
+
+section("config reducer: an empty file is not an empty ruleset")
+st = feed(feed(fresh(), CFG_A), "   \n")
+eq(st.config.rules.length, 1, "whitespace-only content is treated as mid-write")
+
+section("row caption shows what is exceptional, not what is already on screen")
+var capPeer = { HostName: "app-worker-i-0b1e031df86719510",
+                DNSName: "app-worker-i-0b1e031df86719510.example-net.ts.net",
+                Tags: ["tag:role-worker"] }
+eq(Model.rowDetail(capPeer, { user: "ubuntu", address: capPeer.DNSName, port: 0, command: "" }),
+   "ubuntu \u00b7 tag:role-worker",
+   "the machine's own DNS name is dropped — the row title already says it")
+eq(Model.rowDetail(capPeer, { user: "ubuntu", address: capPeer.DNSName, port: 0, command: "tmux new -A -s work" }),
+   "ubuntu \u00b7 tag:role-worker \u00b7 \u21a6 tmux new -A -s work",
+   "so a connect command stays visible instead of being elided off the end")
+eq(Model.rowDetail(capPeer, { user: "ubuntu", address: "100.64.0.5", port: 2222, command: "" }),
+   "ubuntu@100.64.0.5 \u00b7 tag:role-worker \u00b7 port 2222",
+   "an address that is NOT the machine's DNS name is shown, since it is a real override")
+eq(Model.rowDetail({ HostName: "nas", DNSName: "nas.example-net.ts.net", Tags: [] },
+                   { user: "", address: "nas.example-net.ts.net", port: 0, command: "" }),
+   "", "a machine with nothing notable gets no caption clutter")
+
 console.log("\n" + (failures === 0 ? "PASS" : "FAIL") + " — " + (checks - failures) + "/" + checks + " checks")
 process.exit(failures === 0 ? 0 : 1)

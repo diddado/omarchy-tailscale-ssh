@@ -141,6 +141,8 @@ Item {
 
   function osIcon(os) { return Model.osIcon(os) }
 
+  function rowDetail(peer, target) { return Model.rowDetail(peer, target) }
+
   function sshCommandText(entry) {
     if (!entry) return ""
     return Model.sshCommandText(entry.peer, entry.target)
@@ -205,33 +207,54 @@ Item {
     watchChanges: true
     atomicWrites: true
     printErrors: false
-    onLoaded: root.applyConfig(text())
-    // First run: the file does not exist yet. Without this branch configLoaded
-    // never flips and the panel would never show the setup prompt.
-    onLoadFailed: root.applyConfig("")
-    onFileChanged: reload()
+    onLoaded: root.applyConfig(true, text())
+    // A failed read is usually a rename-style save in flight, not a missing
+    // config. The reducer decides which.
+    onLoadFailed: root.applyConfig(false, "")
+    // An editor save emits several inotify events; reading on each one meant
+    // parsing the file mid-write. Settle first, then read once.
+    onFileChanged: configDebounce.restart()
+  }
+
+  Timer {
+    id: configDebounce
+    interval: 150
+    repeat: false
+    onTriggered: configFile.reload()
+  }
+
+  // Armed when the reducer wants a second look: content that failed to parse is
+  // only an error if it is still failing when the writer has finished.
+  Timer {
+    id: configRetry
+    interval: 400
+    repeat: false
+    onTriggered: configFile.reload()
   }
 
   property string _lastConfigText: ""
+  property string _pendingBadText: ""
 
-  function applyConfig(text) {
-    var raw = String(text || "")
-    if (raw === _lastConfigText) {
-      configLoaded = true
-      return
-    }
-    var parsed = Model.parseRules(raw)
-    if (!parsed.ok && raw.trim() !== "") {
-      // Hold the last good rules rather than dropping every user mapping while
-      // the file is halfway through a hand edit.
-      rulesError = parsed.error
-      configLoaded = true
-      return
-    }
-    rulesError = ""
-    _lastConfigText = raw
-    rulesConfig = parsed
-    configLoaded = true
+  function applyConfig(readOk, text) {
+    var next = Model.nextConfigState({
+      lastText: _lastConfigText,
+      error: rulesError,
+      config: rulesConfig,
+      loaded: configLoaded,
+      pendingBadText: _pendingBadText
+    }, { loaded: readOk, text: text })
+
+    _lastConfigText = next.lastText
+    _pendingBadText = next.pendingBadText
+    rulesError = next.error
+    // Same object when nothing changed, so this does not churn the entry list.
+    rulesConfig = next.config
+    configLoaded = next.loaded
+    if (next.retry) configRetry.restart()
+  }
+
+  function reloadConfig() {
+    configFile.reload()
   }
 
   // FileView will not create parent directories, so mkdir has to land first and
@@ -257,6 +280,8 @@ Item {
     }
     var text = Model.serializeConfig(next)
     _lastConfigText = text
+    _pendingBadText = ""
+    rulesError = ""
     rulesConfig = Model.parseRules(text)
     configFile.setText(text)
     flash("Saved")
@@ -294,6 +319,14 @@ Item {
   }
 
   // ---------------------------------------------------------------- polling
+  // Everything the panel shows: the tailnet AND the rules. `refresh()` alone
+  // only re-polls tailscale, which is why the refresh button could not clear a
+  // stale rules error.
+  function refreshAll() {
+    reloadConfig()
+    refresh()
+  }
+
   function refresh() {
     if (statusProcess.running) return
     refreshing = true
