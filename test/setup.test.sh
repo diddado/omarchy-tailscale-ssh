@@ -91,6 +91,24 @@ check "mullvad exit nodes are never offered as ssh targets" \
   '0'
 
 echo
+echo "embedded reference block"
+check "the config carries a _readme reference" \
+  "$(gen flat | jq -r '._readme | length > 5')" \
+  'true'
+check "it names the tmux recipe, which is the option people ask about" \
+  "$(gen flat | jq -r '[._readme[] | select(test("tmux new -A"))] | length')" \
+  '1'
+# The block is duplicated between Model.js and bin/setup because bash cannot
+# import the JS and node is not a runtime dependency. This is the guard.
+if command -v node >/dev/null; then
+  check "bin/setup and Model.js emit an identical reference block" \
+    "$(gen flat | jq -S -c '._readme')" \
+    "$(node -e 'process.stdout.write(JSON.stringify(require("./Model.js").CONFIG_HELP))' | jq -S -c '.')"
+else
+  echo "  skip node not present; cannot compare against Model.js"
+fi
+
+echo
 echo "config shape"
 check "carries a version stamp" "$(gen flat | jq -r '.version')" '1'
 check "seeds a keepalive" "$(gen flat | jq -c '.sshArgs')" '["-o","ServerAliveInterval=30"]'

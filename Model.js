@@ -479,8 +479,50 @@ function ruleFieldsFor(rules, scope) {
   return { user: "", port: 0, command: "" }
 }
 
+// The reference block written into the top of the config file as "_readme".
+// It lives in the file itself so someone editing the JSON has the options in
+// front of them without having to remember where the plugin came from.
+// bin/setup emits the same text; test/setup.test.sh asserts the two match.
+var CONFIG_HELP = [
+  "Tailscale SSH rules. Edits apply immediately - no restart.",
+  "Full docs: https://github.com/diddado/omarchy-tailscale-ssh",
+  "",
+  "Each rule needs exactly one matcher:",
+  "  host    exact machine name, or its full MagicDNS name (case-insensitive)",
+  "  tag     a Tailscale ACL tag; the 'tag:' prefix is optional",
+  "  regex   JavaScript regex tested against the machine name",
+  "  prefix  machine-name prefix; the LONGEST match wins",
+  "",
+  "Rules MERGE weakest-to-strongest, rather than first-match-wins:",
+  "  defaults < prefix < regex < tag < host",
+  "So a prefix rule can set the user for a whole fleet while an exact host rule",
+  "overrides only that machine's port. Fields you do not mention are inherited.",
+  "sshArgs accumulate across tiers instead of replacing.",
+  "",
+  "Optional on any rule:",
+  "  user     SSH login user",
+  "  port     passed as ssh -p",
+  "  sshArgs  extra flags, e.g. [\"-i\", \"~/.ssh/id_ed25519\"]",
+  "  command  run this instead of a login shell; ssh -t is added for you.",
+  "           e.g. \"tmux new -A -s work\" attaches to the session named work,",
+  "           creating it first if it does not exist yet.",
+  "  label    friendlier display name in the panel",
+  "  group    section heading to file the machine under",
+  "  address  override what ssh actually connects to",
+  "  hidden   true drops the machine from the list",
+  "",
+  "Top level: defaultUser, sshArgs, connectVia (dns|ip|hostname), rules.",
+  "",
+  "Re-run setup any time to regenerate groups from your tailnet:",
+  "  ~/.config/omarchy/plugins/io.github.diddado.tailscale-ssh/bin/setup"
+]
+
+// Always re-emits _readme rather than preserving whatever was there: it is
+// documentation, not user data, so keeping it in step with the installed
+// version beats respecting an edit to it.
 function serializeConfig(config) {
   return JSON.stringify({
+    _readme: CONFIG_HELP,
     version: 1,
     defaultUser: String(config.defaultUser || ""),
     connectVia: config.connectVia ? String(config.connectVia) : undefined,
@@ -513,6 +555,7 @@ if (typeof module !== "undefined") {
     ruleScopes: ruleScopes,
     upsertRule: upsertRule,
     ruleFieldsFor: ruleFieldsFor,
-    serializeConfig: serializeConfig
+    serializeConfig: serializeConfig,
+    CONFIG_HELP: CONFIG_HELP
   }
 }

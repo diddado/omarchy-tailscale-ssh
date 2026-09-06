@@ -66,7 +66,13 @@ how far the change reaches — just that machine, everything sharing its prefix,
 or everything carrying one of its tags. Configuring one member of a fleet
 configures the fleet.
 
-The pencil in the panel header opens the rules file in your editor. It lives at:
+The panel header has a **?** that opens this documentation in your browser and a
+**pencil** that opens the rules file in your editor. The file itself starts with
+a `_readme` block listing every matcher and field, so the options are in front of
+you while you edit — no need to come back here. That block is rewritten by the
+plugin on each save, so it stays in step with the installed version.
+
+The rules file lives at:
 
 ```
 ~/.local/state/omarchy/settings/io.github.diddado.tailscale-ssh.json
@@ -127,6 +133,38 @@ All optional, all settable at any tier:
 | `hidden` | `true` drops the machine from the list |
 
 Top level: `defaultUser`, `sshArgs`, `connectVia`, `rules`.
+
+### Landing in tmux instead of a login shell
+
+`command` runs something on arrival. The plugin adds `ssh -t` for you, which
+allocates the TTY that a full-screen program needs:
+
+```json
+{ "host": "build-runner", "command": "tmux new -A -s work" }
+```
+
+`tmux new -A -s work` attaches to the session named `work`, **creating it first
+if it does not exist** — that `-A` is what makes it safe to use as a connect
+command. Without it, `tmux new -s work` fails the second time you connect
+because the session is already there.
+
+Since rules merge, one line gives it to a whole fleet:
+
+```json
+{ "prefix": "app-worker-", "user": "ubuntu", "command": "tmux new -A -s ops" }
+```
+
+Other things worth putting there:
+
+```json
+{ "tag": "role-db",  "command": "sudo -u postgres psql" }
+{ "host": "logs-01", "command": "journalctl -fu myapp" }
+{ "host": "docker-1","command": "sudo docker compose logs -f" }
+```
+
+A machine with a `command` shows it in the panel with a `↦` marker, so you can
+see at a glance which rows do something other than open a shell.
+
 
 ## Widget settings
 

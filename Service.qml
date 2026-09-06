@@ -287,6 +287,12 @@ Item {
     Util.execArgv(["omarchy-launch-config-editor", configPath])
   }
 
+  readonly property string homepage: "https://github.com/diddado/omarchy-tailscale-ssh"
+
+  function openHelp() {
+    Util.execArgv(["omarchy-launch-browser", homepage])
+  }
+
   // ---------------------------------------------------------------- polling
   function refresh() {
     if (statusProcess.running) return

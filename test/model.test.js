@@ -238,9 +238,24 @@ eq(Model.ruleFieldsFor(CONFIG.rules, { kind: "host", value: "app-worker-i-0b1e03
    "a scope with no rule yet reads back blank, so saving cannot pin an inherited user")
 
 section("config serialization")
-eq(JSON.parse(Model.serializeConfig({ defaultUser: "me", rules: [{ host: "a" }] })),
+var serialized = JSON.parse(Model.serializeConfig({ defaultUser: "me", rules: [{ host: "a" }] }))
+delete serialized._readme
+eq(serialized,
    { version: 1, defaultUser: "me", sshArgs: [], rules: [{ host: "a" }] },
    "round-trips with a version stamp")
+
+section("in-file reference block")
+var withHelp = JSON.parse(Model.serializeConfig({ rules: [] }))
+eq(Object.keys(withHelp)[0], "_readme", "the reference sits at the top of the file where it is read first")
+eq(withHelp._readme.length > 5, true, "it is substantial enough to configure from")
+eq(withHelp._readme.some(function (l) { return /tmux new -A/.test(l) }), true,
+   "it spells out the tmux-on-connect recipe")
+eq(withHelp._readme.some(function (l) { return /github\.com/.test(l) }), true,
+   "it names where the plugin came from, so the docs are findable")
+// Rewritten on every save rather than preserved, so it cannot go stale against
+// the installed version. parseRules must therefore ignore it.
+eq(Model.parseRules(Model.serializeConfig({ defaultUser: "me", rules: [{ host: "a" }] })).rules,
+   [{ host: "a" }], "the reference block does not leak into the parsed rules")
 
 console.log("\n" + (failures === 0 ? "PASS" : "FAIL") + " — " + (checks - failures) + "/" + checks + " checks")
 process.exit(failures === 0 ? 0 : 1)

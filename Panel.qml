@@ -290,6 +290,17 @@ Panel {
                 spacing: Style.space(4)
 
                 PanelActionButton {
+                  iconText: "󰋖"
+                  tooltipText: "Documentation"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: {
+                    tailssh.openHelp()
+                    root.close()
+                  }
+                }
+
+                PanelActionButton {
                   iconText: "󰏫"
                   tooltipText: "Edit rules file"
                   foreground: root.foreground
