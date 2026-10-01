@@ -421,6 +421,17 @@ eq(Model.rowDetail({ HostName: "nas", DNSName: "nas.example-net.ts.net", Tags: [
                    { user: "", address: "nas.example-net.ts.net", port: 0, command: "" }),
    "", "a machine with nothing notable gets no caption clutter")
 
+section("row address line")
+eq(Model.rowAddress({ TailscaleIPs: ["100.64.0.5"], TailscaleIPv6: ["fd7a:115c:a1e0::5"] }),
+   "100.64.0.5", "the 100.x address, which is how the machine is actually reached")
+eq(Model.rowAddress({ TailscaleIPs: [], TailscaleIPv6: ["fd7a:115c:a1e0::5"] }),
+   "fd7a:115c:a1e0::5", "falls back to IPv6 on a tailnet with no IPv4")
+eq(Model.rowAddress({ TailscaleIPs: [], TailscaleIPv6: [] }), "",
+   "and the line disappears rather than showing an empty placeholder")
+eq(Model.rowAddress(null), "", "a row with no peer yet asks for nothing")
+eq(Model.rowAddress({ TailscaleIPs: { length: 1, 0: "100.64.0.9" } }), "100.64.0.9",
+   "array-LIKE, not an Array: what a QML property var hands back, and what Array.isArray misses")
+
 // ---------------------------------------------------------------------------
 // Multiple tailnets. Rules are meaningless across tailnets — the machines are
 // entirely different — so each gets its own section, and switching accounts

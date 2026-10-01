@@ -197,6 +197,7 @@ Item {
   function osIcon(os) { return Model.osIcon(os) }
 
   function rowDetail(peer, target) { return Model.rowDetail(peer, target) }
+  function rowAddress(peer) { return Model.rowAddress(peer) }
 
   function sshCommandText(entry) {
     if (!entry) return ""

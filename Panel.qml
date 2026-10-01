@@ -588,6 +588,8 @@ Panel {
     }
     readonly property string detail:
       entry ? tailssh.rowDetail(entry.peer, entry.target) : ""
+    readonly property string address:
+      entry ? tailssh.rowAddress(entry.peer) : ""
 
     hasCursor: root.cursorActive && root.cursorIndex === rowIndex
     foreground: root.foreground
@@ -653,7 +655,22 @@ Panel {
         Text {
           textFormat: Text.PlainText
           Layout.fillWidth: true
+          visible: text !== ""
           text: machineRow.detail
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+
+        // The tailnet address, on its own line: it is the one fact about a
+        // machine you cannot read off the title, and the thing you reach for
+        // when ssh by name is not resolving.
+        Text {
+          textFormat: Text.PlainText
+          Layout.fillWidth: true
+          visible: text !== ""
+          text: machineRow.address
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

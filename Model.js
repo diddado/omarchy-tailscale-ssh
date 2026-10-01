@@ -794,6 +794,23 @@ function rowDetail(peer, target) {
   return parts.join(" \u00b7 ")
 }
 
+// The row's own tailnet address, on its own line under the caption. Both lists
+// were already filtered to the tailnet's ranges and clamped in peerFromStatus,
+// so this only chooses which one to show: the 100.x address a peer is reached
+// by, and the fd7a: one only on a tailnet with no IPv4 at all.
+function rowAddress(peer) {
+  if (!peer) return ""
+  // Duck-typed on .length, never Array.isArray: these lists reach here after a
+  // round trip through a QML `property var`, which hands JS back a
+  // QVariantList-backed object that Array.isArray reports as false. The same
+  // reason rowDetail reads `peer.Tags || []`.
+  var v4 = peer.TailscaleIPs || []
+  if (v4.length > 0) return String(v4[0])
+  var v6 = peer.TailscaleIPv6 || []
+  if (v6.length > 0) return String(v6[0])
+  return ""
+}
+
 // ---------------------------------------------------- multi-tailnet document
 
 // The config file holds one section per tailnet, because the machines you can
@@ -1062,6 +1079,7 @@ if (typeof module !== "undefined") {
     CONFIG_HELP: CONFIG_HELP,
     nextConfigState: nextConfigState,
     rowDetail: rowDetail,
+    rowAddress: rowAddress,
     tailnetKeyFromStatus: tailnetKeyFromStatus,
     parseConfigDocument: parseConfigDocument,
     emptyDocument: emptyDocument,
