@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.diddado.tailscale-ssh",
   "name": "Tailscale SSH",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Chris Miller",
   "license": "MIT",
   "description": "Browse your tailnet and open an SSH terminal to any machine, with the login user resolved per host, tag, regex, or hostname prefix.",

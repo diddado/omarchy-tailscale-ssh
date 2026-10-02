@@ -69,6 +69,7 @@ Panel {
     editUser = fields.user
     editPort = fields.port
     editCommand = fields.command
+    editLoginShell = fields.loginShell === true
   }
 
   function closeEditor() {
@@ -78,13 +79,16 @@ Panel {
   }
 
   function saveEditor() {
-    tailssh.applyRule(editScope, { user: editUser, port: editPort, command: editCommand })
+    tailssh.applyRule(editScope, {
+      user: editUser, port: editPort, command: editCommand, loginShell: editLoginShell
+    })
     closeEditor()
   }
 
   property string editUser: ""
   property int editPort: 0
   property string editCommand: ""
+  property bool editLoginShell: false
 
   function selectedEntry() {
     if (cursorIndex < 0 || cursorIndex >= visibleEntries.length) return null
@@ -822,6 +826,19 @@ Panel {
           onAccepted: root.saveEditor()
           Keys.onEscapePressed: root.closeEditor()
         }
+      }
+
+      // Only meaningful alongside a command: with no command ssh already opens a
+      // login shell, which is the whole of what this asks for.
+      Toggle {
+        width: parent.width
+        label: "Run command in a login shell"
+        description: "Loads the remote profile, so $PATH and the locale match a normal login."
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        checked: root.editLoginShell
+        onClicked: root.editLoginShell = !root.editLoginShell
+        Keys.onEscapePressed: root.closeEditor()
       }
 
       Row {

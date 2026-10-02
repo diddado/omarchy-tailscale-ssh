@@ -582,7 +582,7 @@ Item {
   }
 
   function ruleFieldsFor(scope) {
-    if (!scope) return { user: "", port: 0, command: "" }
+    if (!scope) return { user: "", port: 0, command: "", loginShell: false }
     return Model.ruleFieldsFor(rulesConfig.rules || [], scope)
   }
 

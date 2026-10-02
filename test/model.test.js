@@ -133,6 +133,120 @@ eq(Model.sshArgv(PEERS.appPrimary, resolve(PEERS.appPrimary), "org.omarchy.tails
     "-t", "--", "ubuntu@app-primary.example-net.ts.net", "journalctl --user -fu app"],
    "a connect command adds -t and trails the command as one argv element")
 
+section("a connect command can opt into the remote login shell")
+// `ssh host CMD` runs CMD under `$SHELL -c` -- no profile, so no locale and no
+// profile PATH. Opting in asks for the login shell a bare `ssh host` would give.
+eq(Model.remoteCommand("tmux new -A -s work", true),
+   "exec \"$SHELL\" -l -c 'tmux new -A -s work'",
+   "the command is wrapped and quoted into a single word")
+eq(Model.remoteCommand("tmux new -A -s work", false), "tmux new -A -s work",
+   "opting out leaves the command exactly as written")
+eq(Model.remoteCommand("tmux new -A -s work", undefined), "tmux new -A -s work",
+   "and so does saying nothing: off is the default")
+eq(Model.remoteCommand("", true), "", "nothing to wrap when there is no command")
+
+var LOGIN_CFG = {
+  fallbackUser: "localuser",
+  rules: [{ host: "build-runner", user: "ubuntu", command: "tmux new -A -s work", loginShell: true }]
+}
+var runner = peer("build-runner")
+eq(Model.sshArgv(runner, Model.resolveTarget(runner, LOGIN_CFG), "org.omarchy.tailssh"),
+   ["omarchy-launch-tui", "--app-id=org.omarchy.tailssh-build-runner", "ssh",
+    "-t", "--", "ubuntu@build-runner.example-net.ts.net",
+    "exec \"$SHELL\" -l -c 'tmux new -A -s work'"],
+   "only the trailing element changes; -t and -- stay where they were")
+
+var OFF_CFG = {
+  fallbackUser: "localuser",
+  rules: [{ host: "build-runner", user: "ubuntu", command: "tmux new -A -s work" }]
+}
+eq(Model.sshArgv(runner, Model.resolveTarget(runner, OFF_CFG), "org.omarchy.tailssh"),
+   ["omarchy-launch-tui", "--app-id=org.omarchy.tailssh-build-runner", "ssh",
+    "-t", "--", "ubuntu@build-runner.example-net.ts.net", "tmux new -A -s work"],
+   "without the opt-in the vector is byte-identical to before the feature existed")
+
+var BARE_CFG = { fallbackUser: "localuser", rules: [{ host: "nas", loginShell: true }] }
+eq(Model.sshArgv(PEERS.nas, Model.resolveTarget(PEERS.nas, BARE_CFG), "org.omarchy.tailssh"),
+   ["omarchy-launch-tui", "--app-id=org.omarchy.tailssh-nas", "ssh",
+    "--", "localuser@nas.example-net.ts.net"],
+   "with no command it is a no-op: no -t, no trailing element")
+
+section("the remote command cannot escape its quoting")
+// The emitted form is a run of single-quoted spans joined by escaped quotes, so
+// every input byte sits inside quotes and nothing is left in a position a shell
+// would expand. This regex IS the proof: it admits only those two shapes.
+var QUOTED = /^'([^']|'\\'')*'$/
+var HOSTILE = [
+  "echo it's fine",
+  "'; id; echo '",
+  "$(id)",
+  "`id`",
+  "a'b'c'd",
+  "\"",
+  "\\",
+  "x; rm -rf ~"
+]
+for (var h = 0; h < HOSTILE.length; h++) {
+  eq(QUOTED.test(Model.shellQuote(HOSTILE[h])), true,
+     "quoted form is only quoted spans and escaped quotes: " + JSON.stringify(HOSTILE[h]))
+}
+eq(Model.remoteCommand("echo it's fine", true),
+   "exec \"$SHELL\" -l -c 'echo it'\\''s fine'",
+   "a single quote closes, escapes and reopens -- it cannot end the word")
+eq(Model.remoteCommand("$(id)", true), "exec \"$SHELL\" -l -c '$(id)'",
+   "command substitution is inert inside single quotes")
+
+var hostilePeer = peer("build-runner")
+var hostileArgv = Model.sshArgv(hostilePeer, Model.resolveTarget(hostilePeer, {
+  fallbackUser: "localuser",
+  rules: [{ host: "build-runner", command: "'; id; echo '", loginShell: true }]
+}), "x")
+eq(hostileArgv.length, 7,
+   "quoting never adds an argv element, however many quotes the command carries")
+
+section("loginShell merges like every other field")
+function resolveLogin(rules) {
+  var p = peer("app-worker-i-0b1e031df86719510")
+  return Model.resolveTarget(p, { fallbackUser: "u", rules: rules }).loginShell
+}
+eq(resolveLogin([{ prefix: "app-", loginShell: true }]), true, "a prefix rule can turn it on")
+eq(resolveLogin([{ prefix: "app-", loginShell: true },
+                 { host: "app-worker-i-0b1e031df86719510", loginShell: false }]), false,
+   "and an exact host can turn it back off -- explicit false beats an inherited true")
+eq(resolveLogin([]), false, "unmentioned resolves to off")
+eq(Model.sanitizeRule({ host: "x", loginShell: "yes" }).loginShell, false,
+   "only a literal true counts; a hand-edited \"yes\" is not consent")
+eq(Object.prototype.hasOwnProperty.call(Model.sanitizeRule({ host: "x" }), "loginShell"), false,
+   "absent stays absent, so inherit is distinguishable from explicit false")
+var lsDoc = Model.withTailnetRules(Model.emptyDocument(), "t.ts.net", "t",
+                                   [{ host: "x", loginShell: true }])
+eq(Model.configForTailnet(Model.parseConfigDocument(Model.serializeDocument(lsDoc)).doc,
+                          "t.ts.net").rules,
+   [{ host: "x", loginShell: true }], "it survives a serialize/parse round trip")
+
+section("the editor round-trips the login-shell box")
+var EDIT_SCOPE = { kind: "host", value: "build-runner" }
+var ticked = Model.upsertRule([], EDIT_SCOPE, { user: "ubuntu", port: 0, command: "btop", loginShell: true })
+eq(ticked, [{ host: "build-runner", user: "ubuntu", command: "btop", loginShell: true }],
+   "ticking the box writes the key")
+eq(Model.ruleFieldsFor(ticked, EDIT_SCOPE),
+   { user: "ubuntu", port: 0, command: "btop", loginShell: true },
+   "and the form reads it back")
+eq(Model.upsertRule(ticked, EDIT_SCOPE, { user: "ubuntu", port: 0, command: "btop", loginShell: false }),
+   [{ host: "build-runner", user: "ubuntu", command: "btop" }],
+   "unticking removes the key rather than parking an explicit false")
+eq(Model.upsertRule([{ host: "nas", loginShell: true }], { kind: "host", value: "nas" },
+                    { user: "", port: 0, command: "", loginShell: false }),
+   [], "a rule left holding only its matcher is dropped entirely")
+eq(Model.ruleFieldsFor([], EDIT_SCOPE), { user: "", port: 0, command: "", loginShell: false },
+   "a scope with no rule yet reads back unticked")
+// The editor sends only user/port/command. Without loginShell in RULE_FIELDS,
+// sanitizeRules would silently drop a hand-written opt-in on the next Save.
+eq(Model.upsertRule([{ host: "build-runner", command: "btop", loginShell: true }],
+                    EDIT_SCOPE, { user: "ubuntu", port: 0, command: "btop" }),
+   [{ host: "build-runner", command: "btop", loginShell: true, user: "ubuntu" }],
+   "a hand-written opt-in survives a save that never mentions it")
+
 section("a machine cannot name itself into an ssh option or a shell")
 // Hostnames are chosen by whoever owns the machine, so they are the input this
 // plugin trusts least. Each of these is refused outright rather than quoted:
@@ -306,10 +420,10 @@ eq(before, [{ prefix: "app-", user: "ubuntu" }], "the input array is not mutated
 
 section("form shows what the rule sets, not what resolves")
 eq(Model.ruleFieldsFor(CONFIG.rules, { kind: "prefix", value: "app-worker-" }),
-   { user: "deploy", port: 0, command: "" },
+   { user: "deploy", port: 0, command: "", loginShell: false },
    "reads back the rule's own fields")
 eq(Model.ruleFieldsFor(CONFIG.rules, { kind: "host", value: "app-worker-i-0b1e031df86719510" }),
-   { user: "", port: 0, command: "" },
+   { user: "", port: 0, command: "", loginShell: false },
    "a scope with no rule yet reads back blank, so saving cannot pin an inherited user")
 
 section("config serialization")

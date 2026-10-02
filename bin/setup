@@ -279,6 +279,8 @@ CONFIG_HELP_JSON=$(cat <<'HELPEOF'
   "  port     passed as ssh -p",
   "  sshArgs  extra flags, e.g. [\"-i\", \"~/.ssh/id_ed25519\"]",
   "  command  run this instead of a login shell; ssh -t is added for you.",
+  "  loginShell  true runs that command through the remote login shell, so",
+  "           $PATH and the locale match a normal ssh session",
   "           e.g. \"tmux new -A -s work\" attaches to the session named work,",
   "           creating it first if it does not exist yet.",
   "  label    friendlier display name in the panel",

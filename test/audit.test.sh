@@ -136,6 +136,9 @@ grep -q "omarchy plugin remove $id_manifest" README.md \
   && ok "the README documents the real removal command" \
   || bad "README removal command" "not found"
 
+section "no hard-coded home paths"
+forbid "nothing refers to a specific user's home" '/home/[a-z]' "${QML[@]}" "${SH[@]}" Model.js manifest.json
+
 section "a closed stdin is reopened before the next write"
 # onStarted sets stdinEnabled = false to deliver EOF. That is an imperative
 # assignment over an initial value, so it never comes back by itself: without a
@@ -148,8 +151,39 @@ else
       "writeProc.stdinEnabled = true is missing; only the first save of a session will work"
 fi
 
-section "no hard-coded home paths"
-forbid "nothing refers to a specific user's home" '/home/[a-z]' "${QML[@]}" "${SH[@]}" Model.js manifest.json
+section "the remote command is quoted in exactly one place"
+# The '"'"' idiom is subtle enough that a second, slightly-different copy is how
+# quoting bugs actually ship. One definition, reused.
+quoters="$(grep -cE "replace\(/'/g" Model.js || true)"
+[[ $quoters == 1 ]] && ok "shellQuote is the only POSIX quoter in Model.js" \
+                    || bad "shellQuote is the only POSIX quoter in Model.js" \
+                           "found $quoters definitions, expected 1"
+
+# Asserting the string is not the same as proving the property. Hand each
+# hostile value to a real shell and require it back byte for byte: equality
+# proves the quoting is lossless AND that nothing expanded on the way through.
+if command -v node >/dev/null; then
+  roundtrip_failures=""
+  while IFS= read -r raw; do
+    payload="$(node -e 'process.stdout.write(require("./Model.js").shellQuote(process.argv[1]))' "$raw")"
+    got="$(bash -c "printf %s $payload")"
+    [[ $got == "$raw" ]] || roundtrip_failures+="$raw -> $got"$'\n'
+  done <<'HOSTILE'
+echo it's fine
+'; id; echo '
+$(id)
+`id`
+a'b'c'd
+"
+\
+x; rm -rf ~
+HOSTILE
+  [[ -z $roundtrip_failures ]] && ok "every quoted command survives a real shell unchanged" \
+                               || bad "every quoted command survives a real shell unchanged" \
+                                      "$(printf '%s' "$roundtrip_failures" | head -3)"
+else
+  echo "  skip node not present; cannot round-trip shellQuote"
+fi
 
 printf '\n'
 if [[ $failures -eq 0 ]]; then

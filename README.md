@@ -161,6 +161,7 @@ All optional, all settable at any tier:
 | `port` | `ssh -p` |
 | `sshArgs` | Extra flags — an array, or a string split on whitespace |
 | `command` | Run this on arrival instead of a login shell (adds `ssh -t`) |
+| `loginShell` | `true` runs that command *through* the remote login shell |
 | `label` | Friendlier display name |
 | `group` | Section heading to file the machine under |
 | `address` | Override what ssh connects to |
@@ -198,6 +199,87 @@ Other things worth putting there:
 
 A machine with a `command` shows it in the panel with a `↦` marker, so you can
 see at a glance which rows do something other than open a shell.
+
+#### When the command needs your login environment
+
+`ssh host` opens a **login shell**: `/etc/profile`, `/etc/profile.d/*` and
+`~/.profile` all run, and you get `$LANG`, the full `$PATH`, and whatever else
+they export. `ssh host some-command` does not — sshd runs `$SHELL -c
+some-command`, which sources none of it. That is the normal behaviour of ssh,
+not something this plugin adds, but it is easy to trip over here because
+`command` is the feature that puts you on the second path.
+
+The usual symptom is a program that works when you ssh in by hand and fails
+from the panel:
+
+```
+ERROR: No UTF-8 locale detected!
+```
+
+`btop` says that when `$LANG` is unset. The same gap hides `$PATH` entries, so
+`docker compose logs -f` can come back "command not found" for the same reason.
+
+Set `loginShell` to get the login shell back:
+
+```json
+{ "host": "build-runner", "user": "ubuntu",
+  "command": "tmux new -A -s work", "loginShell": true }
+```
+
+The connect command then runs as `exec "$SHELL" -l -c '<your command>'` — your
+own login shell from `/etc/passwd`, not an assumed `bash`. The checkbox in the
+gear-icon editor sets the same field. Clearing the checkbox *removes* the key
+rather than writing `false`, so to override an inherited `true` from a broader
+rule, write `"loginShell": false` in the file by hand.
+
+It is off by default, because it is a behaviour change for anyone whose remote
+profile prints a banner, takes a while, or `exec`s something of its own.
+
+**If the login shell has no locale either, this will not help you.** Check
+before reaching for it:
+
+```bash
+ssh user@host 'exec "$SHELL" -l -c "echo [\$LANG]; locale charmap"'
+```
+
+An empty value and `ANSI_X3.4-1968` means nothing exports a locale on that host,
+and no shell-level trick can recover one. Cloud images do this: an Ubuntu AMI
+may carry `LANG=C.UTF-8` in `/etc/default/locale` and still never apply it,
+because the `pam_env` line that reads that file is missing from
+`/etc/pam.d/sshd`. Set it in the command instead — `locale -a` says which
+locales exist, and `C.UTF-8` is built into glibc on Ubuntu:
+
+```json
+{ "prefix": "app-worker-", "command": "LC_ALL=C.UTF-8 tmux new -A -s work" }
+```
+
+The durable fix is on the server, not here: give the host a locale every session
+inherits, and tmux, cron and your metrics agent are all fixed at once.
+
+**If you turn it on and nothing changes, the tmux server is why.** A tmux
+*server* keeps the environment it was started with for its whole life, and its
+`update-environment` list does not include `LANG`. Attaching with `-A` adopts
+nothing. So a session first created from the old path still has no locale, and
+new panes inside it inherit the same gap. Once per host:
+
+```bash
+tmux kill-server
+```
+
+If you would rather fix it from the tmux side, this refreshes the session
+environment on attach, reaching panes created after that point:
+
+```tmux
+# ~/.tmux.conf
+set -ga update-environment LANG
+set -ga update-environment "LC_*"
+```
+
+A third option, if your servers allow it, is to forward your own locale instead
+of sourcing a profile — `sshArgs: ["-o", "SendEnv=LANG"]`. That needs
+`AcceptEnv LANG LC_*` in the server's `sshd_config`. Debian and Ubuntu ship it;
+Arch, Fedora and RHEL do not, which is why it is a per-user option here and not
+the plugin's default.
 
 
 ## Widget settings
@@ -258,14 +340,25 @@ chose. Hostnames, tags and DNS names come from whoever owns each machine on the
 tailnet. The rules file is a plain-text document any other process running as
 this user can rewrite. Both are treated accordingly.
 
-**No value ever becomes a command.** Every process is an argv vector; no shell
-string is built from data anywhere in the tree. The `ssh` destination goes after
-`--`, and it is validated besides: `ssh` parses argv with getopt, so a machine
-that names itself `-oProxyCommand=…` would otherwise turn its own hostname into
-a command on your desktop. A destination or login user that does not validate is
-**refused and reported**, never repaired — a silently corrected hostname would
-connect somewhere other than where you meant. The per-machine window id is held
-to `[A-Za-z0-9._-]` because `omarchy-launch-tui` expands it unquoted.
+**No value ever becomes a command here.** Every process this plugin starts is an
+argv vector, and no config value is interpolated into a string that a shell *on
+this desktop* will parse — the hop into the terminal is argv the whole way.
+
+The one shell string built from data is the remote command, and only when a rule
+sets `loginShell`: `exec "$SHELL" -l -c '<command>'`. That string is parsed by
+the *remote* shell, which was already going to parse `command` — the field is a
+remote shell program by design. It is wrapped in POSIX single quotes with the
+`'\''` escape, so every byte of the configured text sits inside a quoted span
+and the text cannot end the word it is in. Quoting it grants it nothing it did
+not already have.
+
+The `ssh` destination goes after `--`, and it is validated besides: `ssh` parses
+argv with getopt, so a machine that names itself `-oProxyCommand=…` would
+otherwise turn its own hostname into a command on your desktop. A destination or
+login user that does not validate is **refused and reported**, never repaired —
+a silently corrected hostname would connect somewhere other than where you
+meant. The per-machine window id is held to `[A-Za-z0-9._-]` because
+`omarchy-launch-tui` expands it unquoted.
 
 **Nothing is read or written through a pathname.** `bin/statefile` is the one
 place the rules file is touched. It walks the directory chain from a trusted

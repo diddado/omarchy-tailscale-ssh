@@ -326,7 +326,7 @@ function matchingRules(peer, rules) {
 }
 
 function mergeRule(into, rule) {
-  var scalars = ["user", "port", "command", "label", "group", "address", "hidden"]
+  var scalars = ["user", "port", "command", "label", "group", "address", "hidden", "loginShell"]
   for (var i = 0; i < scalars.length; i++) {
     var key = scalars[i]
     // hasOwnProperty, not a truthiness test: a rules file is JSON, and JSON.parse
@@ -367,6 +367,7 @@ function resolveTarget(peer, config) {
     group: "",
     address: "",
     hidden: false,
+    loginShell: false,
     sshArgs: []
   }
 
@@ -392,6 +393,7 @@ function resolveTarget(peer, config) {
   resolved.port = parseInt(resolved.port, 10)
   if (!isFinite(resolved.port) || resolved.port < 0 || resolved.port > 65535) resolved.port = 0
   resolved.hidden = resolved.hidden === true
+  resolved.loginShell = resolved.loginShell === true
   resolved.matchedRuleCount = matches.length
   resolved.problem = targetProblem(resolved)
 
@@ -445,6 +447,30 @@ function targetProblem(target) {
 // be interpolated into something a shell would re-tokenize. Returns [] when the
 // target does not validate -- the caller reports target.problem rather than
 // connecting to a best guess.
+// POSIX single-quoting, and the only place in the tree that does it. Splitting
+// on ' and emitting '...'\''...' leaves every input byte inside a quoted span:
+// the one region outside quotes is the two-character \' , which holds no input.
+// So a value carrying a quote cannot escape -- closing the quote is exactly what
+// the escape already did, immediately before reopening it.
+function shellQuote(value) {
+  return "'" + String(value === undefined || value === null ? "" : value).replace(/'/g, "'\\''") + "'"
+}
+
+// `ssh host CMD` makes sshd run `$SHELL -c CMD` -- a non-login, non-interactive
+// shell, so /etc/profile and ~/.profile never run and the session has no locale
+// and no profile PATH. A plain `ssh host` gets a login shell and does. Opting in
+// asks for the second from the first.
+//
+// "$SHELL" rather than bash: sshd always sets it from the passwd entry, and
+// hardcoding bash would source a profile the user has never seen (or none at
+// all, on a host without bash). The command was already a remote shell program
+// by design, so quoting it into one word grants it nothing it did not have.
+function remoteCommand(command, loginShell) {
+  var text = String(command === undefined || command === null ? "" : command)
+  if (text === "" || loginShell !== true) return text
+  return 'exec "$SHELL" -l -c ' + shellQuote(text)
+}
+
 function sshArgv(peer, target, appIdPrefix) {
   if (targetProblem(target) !== "") return []
 
@@ -459,7 +485,7 @@ function sshArgv(peer, target, appIdPrefix) {
   // Everything after this point is data, not flags.
   argv.push("--")
   argv.push(user === "" ? host : user + "@" + host)
-  if (target.command) argv.push(String(target.command))
+  if (target.command) argv.push(remoteCommand(target.command, target.loginShell))
   return argv
 }
 
@@ -471,7 +497,7 @@ function sshCommandText(peer, target) {
   if (argv.length === 0) return ""
   var parts = argv.slice(2)
   return parts.map(function (part) {
-    return /^[A-Za-z0-9@:._\/-]+$/.test(part) ? part : "'" + part.replace(/'/g, "'\\''") + "'"
+    return /^[A-Za-z0-9@:._\/-]+$/.test(part) ? part : shellQuote(part)
   }).join(" ")
 }
 
@@ -482,7 +508,8 @@ function sshCommandText(peer, target) {
 // 10 MB `label`, a `port` of "1e9", or a key called "__proto__" cannot travel
 // any further than this function.
 var RULE_MATCHERS = ["host", "tag", "regex", "prefix"]
-var RULE_FIELDS = ["user", "port", "command", "label", "group", "address", "hidden", "sshArgs"]
+var RULE_FIELDS = ["user", "port", "command", "label", "group", "address", "hidden", "sshArgs",
+                   "loginShell"]
 
 function sanitizeRule(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null
@@ -502,8 +529,10 @@ function sanitizeRule(raw) {
     if (key === "port") {
       var port = parseInt(value, 10)
       if (isFinite(port) && port > 0 && port <= 65535) rule.port = port
-    } else if (key === "hidden") {
-      rule.hidden = value === true
+    } else if (key === "hidden" || key === "loginShell") {
+      // Only a literal true, mirroring hidden: a hand-edited "yes" must not
+      // read as consent to change how the command is run.
+      rule[key] = value === true
     } else if (key === "sshArgs") {
       var args = asArray(value)
       if (args.length > 0) rule.sshArgs = args
@@ -673,7 +702,11 @@ function upsertRule(rules, scope, fields) {
   for (var key in fields) {
     if (!Object.prototype.hasOwnProperty.call(fields, key) || !safeKey(key)) continue
     var value = fields[key]
-    var blank = value === undefined || value === null || value === "" || value === 0
+    // false counts as blank: both booleans in the schema default to false, so
+    // an unticked box should remove the key rather than park a dead rule that
+    // says nothing. An explicit false is still honoured when written by hand.
+    var blank = value === undefined || value === null || value === "" || value === 0 ||
+                value === false
     if (blank) delete target[key]
     else target[key] = value
   }
@@ -704,11 +737,12 @@ function ruleFieldsFor(rules, scope) {
       return {
         user: String(r.user || ""),
         port: parseInt(r.port, 10) || 0,
-        command: String(r.command || "")
+        command: String(r.command || ""),
+        loginShell: r.loginShell === true
       }
     }
   }
-  return { user: "", port: 0, command: "" }
+  return { user: "", port: 0, command: "", loginShell: false }
 }
 
 // The reference block written into the top of the config file as "_readme".
@@ -745,6 +779,8 @@ var CONFIG_HELP = [
   "  port     passed as ssh -p",
   "  sshArgs  extra flags, e.g. [\"-i\", \"~/.ssh/id_ed25519\"]",
   "  command  run this instead of a login shell; ssh -t is added for you.",
+  "  loginShell  true runs that command through the remote login shell, so",
+  "           $PATH and the locale match a normal ssh session",
   "           e.g. \"tmux new -A -s work\" attaches to the session named work,",
   "           creating it first if it does not exist yet.",
   "  label    friendlier display name in the panel",
@@ -1078,6 +1114,8 @@ if (typeof module !== "undefined") {
     serializeConfig: serializeConfig,
     CONFIG_HELP: CONFIG_HELP,
     nextConfigState: nextConfigState,
+    shellQuote: shellQuote,
+    remoteCommand: remoteCommand,
     rowDetail: rowDetail,
     rowAddress: rowAddress,
     tailnetKeyFromStatus: tailnetKeyFromStatus,

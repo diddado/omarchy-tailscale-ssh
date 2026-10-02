@@ -101,6 +101,10 @@ check "the config carries a _readme reference" \
 check "it names the tmux recipe, which is the option people ask about" \
   "$(gen flat | jq -r '[._readme[] | select(test("tmux new -A"))] | length')" \
   '1'
+# The escape hatch must never ship undocumented in the very file people edit.
+check "it names the loginShell opt-in" \
+  "$(gen flat | jq -r '[._readme[] | select(test("loginShell"))] | length')" \
+  '1'
 # The block is duplicated between Model.js and bin/setup because bash cannot
 # import the JS and node is not a runtime dependency. This is the guard.
 if command -v node >/dev/null; then
