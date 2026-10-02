@@ -485,6 +485,12 @@ Item {
     _writePending = text
     _writeErr = ""
     writeProc.command = [pythonPath, "-I", statefileHelper, "write", configPath]
+    // onStarted closes stdin to deliver EOF, and that does NOT come back on its
+    // own: `stdinEnabled: true` above is an initial value, not a binding. Without
+    // this, every save after the first hands the helper a stdin that never opens
+    // and never closes, so it blocks in read(), the deadline SIGTERMs it, and the
+    // save is lost behind an error with no stderr to explain it.
+    writeProc.stdinEnabled = true
     writeProc.running = true
     writeDeadline.restart()
   }

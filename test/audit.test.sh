@@ -136,6 +136,18 @@ grep -q "omarchy plugin remove $id_manifest" README.md \
   && ok "the README documents the real removal command" \
   || bad "README removal command" "not found"
 
+section "a closed stdin is reopened before the next write"
+# onStarted sets stdinEnabled = false to deliver EOF. That is an imperative
+# assignment over an initial value, so it never comes back by itself: without a
+# reset in startWrite, the second save of a session blocks the helper in read()
+# until the deadline kills it, and the save is lost. Cost a release to find once.
+if grep -qE '^\s*writeProc\.stdinEnabled = true' Service.qml; then
+  ok "startWrite reopens stdin before running the helper"
+else
+  bad "startWrite reopens stdin before running the helper" \
+      "writeProc.stdinEnabled = true is missing; only the first save of a session will work"
+fi
+
 section "no hard-coded home paths"
 forbid "nothing refers to a specific user's home" '/home/[a-z]' "${QML[@]}" "${SH[@]}" Model.js manifest.json
 
